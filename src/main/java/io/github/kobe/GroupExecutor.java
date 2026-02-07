@@ -1,5 +1,7 @@
 package io.github.kobe;
 
+import io.github.kobe.internal.GroupBulkheadManager;
+import io.github.kobe.internal.GroupExecutorManager;
 import io.github.kobe.internal.GroupSemaphoreManager;
 
 import java.util.ArrayList;
@@ -7,7 +9,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -17,22 +18,35 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class GroupExecutor implements AutoCloseable {
 
     private final GroupPolicy policy;
-    private final ExecutorService executor;
+    private final GroupExecutorManager executorManager;
     private final GroupSemaphoreManager semaphoreManager;
+    private final GroupBulkheadManager bulkheadManager;
+    private final Semaphore globalInFlightSemaphore;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    private GroupExecutor(GroupPolicy policy, ExecutorService executor, GroupSemaphoreManager semaphoreManager) {
+    private GroupExecutor(GroupPolicy policy,
+                          GroupExecutorManager executorManager,
+                          GroupSemaphoreManager semaphoreManager,
+                          GroupBulkheadManager bulkheadManager,
+                          Semaphore globalInFlightSemaphore) {
         this.policy = Objects.requireNonNull(policy, "policy");
-        this.executor = Objects.requireNonNull(executor, "executor");
+        this.executorManager = Objects.requireNonNull(executorManager, "executorManager");
         this.semaphoreManager = Objects.requireNonNull(semaphoreManager, "semaphoreManager");
+        this.bulkheadManager = Objects.requireNonNull(bulkheadManager, "bulkheadManager");
+        this.globalInFlightSemaphore = Objects.requireNonNull(globalInFlightSemaphore, "globalInFlightSemaphore");
     }
 
     /**
-     * Create a new executor backed by virtual threads.
+     * Create a new executor backed by virtual threads with per-group isolation.
      */
     public static GroupExecutor newVirtualThreadExecutor(GroupPolicy policy) {
-        ExecutorService executorService = Executors.newVirtualThreadPerTaskExecutor();
-        return new GroupExecutor(policy, executorService, new GroupSemaphoreManager(policy));
+        return new GroupExecutor(
+                policy,
+                new GroupExecutorManager(),
+                new GroupSemaphoreManager(policy),
+                new GroupBulkheadManager(policy),
+                new Semaphore(policy.globalMaxInFlight(), true)
+        );
     }
 
     /**
@@ -44,7 +58,8 @@ public final class GroupExecutor implements AutoCloseable {
         Objects.requireNonNull(taskId, "taskId");
         Objects.requireNonNull(task, "task");
 
-        var future = executor.submit(() -> executeWithSemaphore(groupKey, taskId, task));
+        ExecutorService groupExecutor = executorManager.executorFor(groupKey);
+        var future = groupExecutor.submit(() -> executeWithIsolation(groupKey, taskId, task));
         return new TaskHandle<>(groupKey, taskId, future);
     }
 
@@ -80,22 +95,29 @@ public final class GroupExecutor implements AutoCloseable {
         return results;
     }
 
-    private <T> GroupResult<T> executeWithSemaphore(String groupKey, String taskId, java.util.concurrent.Callable<T> task) {
-        Semaphore semaphore = semaphoreManager.semaphoreFor(groupKey);
+    private <T> GroupResult<T> executeWithIsolation(String groupKey, String taskId, java.util.concurrent.Callable<T> task) {
         long startNanos = System.nanoTime();
-        boolean acquired = false;
+        boolean globalAcquired = false;
+        boolean bulkheadAcquired = false;
+        boolean semaphoreAcquired = false;
+        Semaphore bulkhead = bulkheadManager.bulkheadFor(groupKey);
+        Semaphore semaphore = semaphoreManager.semaphoreFor(groupKey);
         try {
-            semaphore.acquire();
-            acquired = true;
+            globalInFlightSemaphore.acquire();   // Layer 1: global in-flight
+            globalAcquired = true;
+            bulkhead.acquire();                  // Layer 2: per-group in-flight
+            bulkheadAcquired = true;
+            semaphore.acquire();                 // Layer 3: per-group concurrency
+            semaphoreAcquired = true;
             return executeTask(groupKey, taskId, task, startNanos);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             long end = System.nanoTime();
             return GroupResult.cancelled(groupKey, taskId, e, startNanos, end);
         } finally {
-            if (acquired) {
-                semaphore.release();
-            }
+            if (semaphoreAcquired) semaphore.release();
+            if (bulkheadAcquired) bulkhead.release();
+            if (globalAcquired) globalInFlightSemaphore.release();
         }
     }
 
@@ -118,9 +140,16 @@ public final class GroupExecutor implements AutoCloseable {
         }
     }
 
+    /**
+     * Shut down a single group's executor without affecting other groups.
+     */
+    public void shutdownGroup(String groupKey) {
+        executorManager.shutdownGroup(groupKey);
+    }
+
     public void shutdown() {
         if (closed.compareAndSet(false, true)) {
-            executor.shutdown();
+            executorManager.close();
         }
     }
 

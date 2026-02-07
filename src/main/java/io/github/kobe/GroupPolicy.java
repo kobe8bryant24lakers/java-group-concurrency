@@ -16,12 +16,21 @@ public final class GroupPolicy {
     private final ToIntFunction<String> concurrencyResolver;
     private final int defaultMaxConcurrencyPerGroup;
 
+    private final int globalMaxInFlight;
+    private final int defaultMaxInFlightPerGroup;
+    private final Map<String, Integer> perGroupMaxInFlight;
+
     private GroupPolicy(Builder builder) {
         this.perGroupMaxConcurrency = builder.perGroupMaxConcurrency == null
                 ? Collections.emptyMap()
                 : Collections.unmodifiableMap(new HashMap<>(builder.perGroupMaxConcurrency));
         this.concurrencyResolver = builder.concurrencyResolver;
         this.defaultMaxConcurrencyPerGroup = sanitize(builder.defaultMaxConcurrencyPerGroup);
+        this.globalMaxInFlight = sanitize(builder.globalMaxInFlight);
+        this.defaultMaxInFlightPerGroup = sanitize(builder.defaultMaxInFlightPerGroup);
+        this.perGroupMaxInFlight = builder.perGroupMaxInFlight == null
+                ? Collections.emptyMap()
+                : Collections.unmodifiableMap(new HashMap<>(builder.perGroupMaxInFlight));
     }
 
     /**
@@ -47,6 +56,26 @@ public final class GroupPolicy {
         return defaultMaxConcurrencyPerGroup;
     }
 
+    /**
+     * Resolve the max in-flight tasks for the given group key.
+     * Priority: per-group override &gt; default value.
+     *
+     * @param groupKey group identifier, must not be null
+     * @return max in-flight tasks &gt;= 1
+     */
+    public int resolveMaxInFlight(String groupKey) {
+        Objects.requireNonNull(groupKey, "groupKey");
+        Integer overridden = perGroupMaxInFlight.get(groupKey);
+        if (overridden != null) {
+            return sanitize(overridden);
+        }
+        return defaultMaxInFlightPerGroup;
+    }
+
+    public int globalMaxInFlight() {
+        return globalMaxInFlight;
+    }
+
     private int sanitize(int raw) {
         return raw >= 1 ? raw : 1;
     }
@@ -63,6 +92,14 @@ public final class GroupPolicy {
         return defaultMaxConcurrencyPerGroup;
     }
 
+    public int defaultMaxInFlightPerGroup() {
+        return defaultMaxInFlightPerGroup;
+    }
+
+    public Map<String, Integer> perGroupMaxInFlight() {
+        return perGroupMaxInFlight;
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -71,6 +108,9 @@ public final class GroupPolicy {
         private Map<String, Integer> perGroupMaxConcurrency;
         private ToIntFunction<String> concurrencyResolver;
         private int defaultMaxConcurrencyPerGroup = 1;
+        private int globalMaxInFlight = Integer.MAX_VALUE;
+        private int defaultMaxInFlightPerGroup = Integer.MAX_VALUE;
+        private Map<String, Integer> perGroupMaxInFlight;
 
         private Builder() {
         }
@@ -96,6 +136,30 @@ public final class GroupPolicy {
          */
         public Builder defaultMaxConcurrencyPerGroup(int defaultMaxConcurrencyPerGroup) {
             this.defaultMaxConcurrencyPerGroup = defaultMaxConcurrencyPerGroup;
+            return this;
+        }
+
+        /**
+         * Set global max in-flight tasks across all groups.
+         */
+        public Builder globalMaxInFlight(int globalMaxInFlight) {
+            this.globalMaxInFlight = globalMaxInFlight;
+            return this;
+        }
+
+        /**
+         * Set default max in-flight tasks per group.
+         */
+        public Builder defaultMaxInFlightPerGroup(int defaultMaxInFlightPerGroup) {
+            this.defaultMaxInFlightPerGroup = defaultMaxInFlightPerGroup;
+            return this;
+        }
+
+        /**
+         * Set per-group max in-flight overrides (copied defensively).
+         */
+        public Builder perGroupMaxInFlight(Map<String, Integer> perGroupMaxInFlight) {
+            this.perGroupMaxInFlight = perGroupMaxInFlight;
             return this;
         }
 

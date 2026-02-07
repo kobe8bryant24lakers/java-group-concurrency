@@ -6,9 +6,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GroupExecutorTest {
@@ -175,6 +177,167 @@ class GroupExecutorTest {
             assertTrue(vipMax.get() <= 4, "vip concurrency should respect resolver (<=4)");
             assertTrue(vipMax.get() > 1, "vip group should allow higher concurrency than default");
             assertEquals(1, regularMax.get(), "default concurrency should be 1 for regular group");
+        }
+    }
+
+    @Test
+    void testPerGroupInFlightBulkhead() throws Exception {
+        // Layer 2: per-group in-flight bulkhead limits total tasks queued + running per group
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(4)
+                .defaultMaxInFlightPerGroup(3) // Only 3 tasks can be in-flight per group
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            int taskCount = 6;
+            CountDownLatch gate = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(taskCount);
+            AtomicInteger inFlight = new AtomicInteger();
+            AtomicInteger maxInFlight = new AtomicInteger();
+
+            List<TaskHandle<Void>> handles = new ArrayList<>();
+            for (int i = 0; i < taskCount; i++) {
+                handles.add(executor.submit("bulkhead-group", "t-" + i, () -> {
+                    gate.await();
+                    int current = inFlight.incrementAndGet();
+                    maxInFlight.accumulateAndGet(current, Math::max);
+                    Thread.sleep(80);
+                    inFlight.decrementAndGet();
+                    done.countDown();
+                    return null;
+                }));
+            }
+
+            gate.countDown();
+            done.await();
+            for (TaskHandle<Void> handle : handles) {
+                assertEquals(TaskStatus.SUCCESS, handle.await().status());
+            }
+            assertTrue(maxInFlight.get() <= 3,
+                    "per-group in-flight should be capped at 3 but was " + maxInFlight.get());
+        }
+    }
+
+    @Test
+    void testGlobalInFlightFairness() throws Exception {
+        // Layer 1: global in-flight limit ensures total tasks across all groups is bounded
+        int globalLimit = 4;
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(10)
+                .globalMaxInFlight(globalLimit)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            int tasksPerGroup = 4;
+            int groupCount = 3;
+            int totalTasks = tasksPerGroup * groupCount;
+            CountDownLatch gate = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(totalTasks);
+            AtomicInteger totalInFlight = new AtomicInteger();
+            AtomicInteger maxTotalInFlight = new AtomicInteger();
+
+            List<TaskHandle<Void>> handles = new ArrayList<>();
+            for (int g = 0; g < groupCount; g++) {
+                String group = "group-" + g;
+                for (int t = 0; t < tasksPerGroup; t++) {
+                    handles.add(executor.submit(group, group + "-t-" + t, () -> {
+                        gate.await();
+                        int current = totalInFlight.incrementAndGet();
+                        maxTotalInFlight.accumulateAndGet(current, Math::max);
+                        Thread.sleep(60);
+                        totalInFlight.decrementAndGet();
+                        done.countDown();
+                        return null;
+                    }));
+                }
+            }
+
+            gate.countDown();
+            done.await();
+            for (TaskHandle<Void> handle : handles) {
+                assertEquals(TaskStatus.SUCCESS, handle.await().status());
+            }
+            assertTrue(maxTotalInFlight.get() <= globalLimit,
+                    "global in-flight should be capped at " + globalLimit + " but was " + maxTotalInFlight.get());
+        }
+    }
+
+    @Test
+    void testShutdownGroupDoesNotAffectOtherGroups() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(2)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            // Submit tasks to group A
+            CountDownLatch groupAStarted = new CountDownLatch(1);
+            CountDownLatch groupABlock = new CountDownLatch(1);
+            TaskHandle<String> handleA = executor.submit("A", "a-1", () -> {
+                groupAStarted.countDown();
+                groupABlock.await();
+                return "A-done";
+            });
+
+            // Wait for group A task to start
+            groupAStarted.await();
+
+            // Shutdown group B — should not affect group A
+            executor.shutdownGroup("B");
+
+            // Group A task should still complete
+            groupABlock.countDown();
+            GroupResult<String> resultA = handleA.await();
+            assertEquals(TaskStatus.SUCCESS, resultA.status());
+            assertEquals("A-done", resultA.value());
+
+            // Should be able to submit new tasks to group B (new executor created)
+            TaskHandle<String> handleB = executor.submit("B", "b-1", () -> "B-done");
+            GroupResult<String> resultB = handleB.await();
+            assertEquals(TaskStatus.SUCCESS, resultB.status());
+            assertEquals("B-done", resultB.value());
+        }
+    }
+
+    @Test
+    void testUnlimitedDefaultsBehaveLikeOriginal() throws Exception {
+        // With no isolation config, behavior should match original implementation
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(2)
+                .build();
+
+        // Verify defaults are Integer.MAX_VALUE
+        assertEquals(Integer.MAX_VALUE, policy.globalMaxInFlight());
+        assertEquals(Integer.MAX_VALUE, policy.defaultMaxInFlightPerGroup());
+        assertTrue(policy.perGroupMaxInFlight().isEmpty());
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            int taskCount = 6;
+            CountDownLatch gate = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(taskCount);
+            AtomicInteger current = new AtomicInteger();
+            AtomicInteger maxSeen = new AtomicInteger();
+
+            List<TaskHandle<Void>> handles = new ArrayList<>();
+            for (int i = 0; i < taskCount; i++) {
+                handles.add(executor.submit("g", "t-" + i, () -> {
+                    gate.await();
+                    int inFlight = current.incrementAndGet();
+                    maxSeen.accumulateAndGet(inFlight, Math::max);
+                    Thread.sleep(80);
+                    current.decrementAndGet();
+                    done.countDown();
+                    return null;
+                }));
+            }
+
+            gate.countDown();
+            done.await();
+            for (TaskHandle<Void> handle : handles) {
+                assertEquals(TaskStatus.SUCCESS, handle.await().status());
+            }
+            // Concurrency should still be limited by Layer 3 (maxConcurrency=2)
+            assertTrue(maxSeen.get() <= 2,
+                    "concurrency should be capped at 2 by Layer 3, but was " + maxSeen.get());
         }
     }
 }
