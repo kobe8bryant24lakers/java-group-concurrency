@@ -25,10 +25,18 @@ public final class GroupSemaphoreManager {
 
     private Semaphore createSemaphore(String groupKey) {
         int permits = policy.resolveConcurrency(groupKey);
-        return new Semaphore(permits);
+        return new Semaphore(permits, true);
     }
 
     public int knownGroupCount() {
         return semaphoreByGroup.size();
+    }
+
+    public void clear() {
+        semaphoreByGroup.clear();
+    }
+
+    public void evict(String groupKey) {
+        semaphoreByGroup.remove(groupKey);
     }
 }

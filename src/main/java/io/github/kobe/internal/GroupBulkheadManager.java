@@ -26,4 +26,12 @@ public final class GroupBulkheadManager {
     private Semaphore create(String groupKey) {
         return new Semaphore(policy.resolveMaxInFlight(groupKey), true);
     }
+
+    public void clear() {
+        bulkheadByGroup.clear();
+    }
+
+    public void evict(String groupKey) {
+        bulkheadByGroup.remove(groupKey);
+    }
 }

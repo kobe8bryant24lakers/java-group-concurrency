@@ -685,3 +685,90 @@ mvn -Dmaven.repo.local=./.m2/repository -Dtest=GroupExecutorTest#testPerGroupInF
 | Fair Semaphore 性能开销 | 相比非公平 Semaphore 多一次 FIFO 队列操作，在虚拟线程场景下开销可忽略 |
 | `Integer.MAX_VALUE` 默认值的 acquire/release 开销 | Semaphore 在 permits 充足时 acquire 仅一次 CAS，开销极小；如需极致性能可后续加条件跳过 |
 | Carrier 线程 pinning 跨组影响 | JVM 层面限制，等待 JDK 24 JEP 491 修复；当前方案在逻辑层面隔离影响范围 |
+
+---
+
+## 12. 全面优化（Bug 修复 + 功能增强 + 测试补充）
+
+### 12.1 Bug 修复与健壮性加固
+
+| 修复项 | 文件 | 描述 |
+|--------|------|------|
+| Builder 防御性拷贝 | `GroupPolicy.java` | `perGroupMaxConcurrency()` 和 `perGroupMaxInFlight()` setter 立即拷贝传入的 Map，防止调用方后续修改泄漏 |
+| Shutdown 语义统一 | `GroupExecutorManager.java` | `close()` 改用 `shutdownNow()` + `clear()`，避免任务卡住时无限阻塞 |
+| Shutdown 清理缓存 | `GroupSemaphoreManager`, `GroupBulkheadManager`, `GroupExecutor` | 新增 `clear()` 方法，`shutdown()` 时清理所有 Manager 的 ConcurrentHashMap，允许 GC |
+| shutdownGroup 竞态修复 | `GroupExecutorManager.java` | `shutdownGroup()` 使用 `ConcurrentHashMap.compute()` 确保 remove + shutdownNow 的原子性 |
+| Semaphore 公平性统一 | `GroupSemaphoreManager.java` | Layer 3 也使用 `fair=true` 的 Semaphore，与 Layer 1/2 保持一致，避免饥饿 |
+
+### 12.2 功能增强
+
+#### TaskHandle 超时等待
+
+`TaskHandle` 新增 `await(long timeout, TimeUnit unit)` 和 `join(long timeout, TimeUnit unit)`。超时返回 `CANCELLED` 状态的 `GroupResult`（error 为 `TimeoutException`），不自动取消底层任务。
+
+#### CompletableFuture 桥接
+
+`TaskHandle.toCompletableFuture()` 通过一个虚拟线程桥接 `Future` 到 `CompletableFuture<GroupResult<T>>`，支持链式异步组合。
+
+#### 带超时的优雅关闭
+
+`GroupExecutor.shutdown(Duration timeout)`：先 `shutdown()` 等待指定时长，超时后 `shutdownNow()` 强制终止。返回 `boolean` 表示是否在超时前全部完成。`GroupExecutorManager.awaitTermination(Duration)` 提供底层实现。
+
+#### 分组缓存淘汰
+
+`GroupExecutor.evictGroup(String groupKey)`：移除指定 group 的所有缓存资源（Executor、Semaphore、Bulkhead），下次该 group 有任务时重新创建。三个 Manager 均新增 `evict(groupKey)` 方法。
+
+#### 任务生命周期监听器
+
+新增 `TaskLifecycleListener` 接口：
+
+```java
+public interface TaskLifecycleListener {
+    default void onSubmitted(String groupKey, String taskId) {}
+    default void onStarted(String groupKey, String taskId) {}
+    default void onCompleted(String groupKey, String taskId, GroupResult<?> result) {}
+}
+```
+
+通过 `GroupPolicy.Builder.taskLifecycleListener()` 配置。`GroupExecutor` 在 submit/executeWithIsolation/executeTask 中调用，异常静默捕获。
+
+### 12.3 测试覆盖
+
+总计 25 个测试（8 原有 + 17 新增）：
+
+| 测试方法 | 验证内容 |
+|---------|---------|
+| `testSubmitAfterShutdownThrows` | shutdown 后 submit 抛出 IllegalStateException |
+| `testExecuteAllAfterShutdownThrows` | shutdown 后 executeAll 抛出 IllegalStateException |
+| `testMultipleCloseIsIdempotent` | 多次 close() 不抛异常 |
+| `testCancelInterruptsBlockedTask` | cancel(true) 中断阻塞任务，返回 CANCELLED |
+| `testResolverReturningZeroCoercedToOne` | resolver 返回 0 被修正为 1 |
+| `testResolverReturningNegativeCoercedToOne` | resolver 返回负数被修正为 1 |
+| `testResolverThrowingFallsBackToDefault` | resolver 抛异常回退到 default |
+| `testGroupTaskNullValidation` | GroupTask 构造传 null 抛 NPE |
+| `testBuilderDefensiveCopy` | Builder 防御性拷贝验证 |
+| `testHighConcurrencyStress` | 10 组 × 100 任务压力测试 |
+| `testTaskHandleAwaitWithTimeout` | await 超时返回 CANCELLED + TimeoutException |
+| `testTaskHandleJoinWithTimeout` | join 超时返回 CANCELLED + TimeoutException |
+| `testToCompletableFuture` | CompletableFuture 桥接正确完成 |
+| `testEvictGroup` | evictGroup 后可重新创建资源 |
+| `testTaskLifecycleListener` | 监听器回调正确触发 |
+| `testTaskLifecycleListenerExceptionIsSilent` | 监听器异常静默捕获，不影响任务 |
+| `testGracefulShutdownWithTimeout` | 带超时的优雅关闭 |
+
+### 12.4 更新后的包结构
+
+```
+io.github.kobe
+├── GroupExecutor.java             // 核心执行器（入口）
+├── GroupPolicy.java               // 并发策略 + 隔离策略（Builder）
+├── GroupTask.java                 // 任务定义（record）
+├── GroupResult.java               // 执行结果（record）
+├── TaskHandle.java                // 提交句柄（含超时 + CompletableFuture）
+├── TaskStatus.java                // 状态枚举
+├── TaskLifecycleListener.java     // 任务生命周期监听器接口（新）
+└── internal/
+    ├── GroupSemaphoreManager.java  // Layer 3: per-group 并发 Semaphore 管理（fair）
+    ├── GroupBulkheadManager.java   // Layer 2: per-group 在途 Semaphore 管理（fair）
+    └── GroupExecutorManager.java   // Per-group 虚拟线程执行器管理
+```

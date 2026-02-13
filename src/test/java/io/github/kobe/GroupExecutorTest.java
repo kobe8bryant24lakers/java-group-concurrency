@@ -3,14 +3,21 @@ package io.github.kobe;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GroupExecutorTest {
@@ -339,5 +346,346 @@ class GroupExecutorTest {
             assertTrue(maxSeen.get() <= 2,
                     "concurrency should be capped at 2 by Layer 3, but was " + maxSeen.get());
         }
+    }
+
+    // ==================== Phase 2: New Tests ====================
+
+    @Test
+    void testSubmitAfterShutdownThrows() {
+        GroupPolicy policy = GroupPolicy.builder().build();
+        GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy);
+        executor.shutdown();
+
+        assertThrows(IllegalStateException.class, () ->
+                executor.submit("g", "t-1", () -> "value"));
+    }
+
+    @Test
+    void testExecuteAllAfterShutdownThrows() {
+        GroupPolicy policy = GroupPolicy.builder().build();
+        GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy);
+        executor.shutdown();
+
+        List<GroupTask<String>> tasks = List.of(new GroupTask<>("g", "t-1", () -> "value"));
+        assertThrows(IllegalStateException.class, () -> executor.executeAll(tasks));
+    }
+
+    @Test
+    void testMultipleCloseIsIdempotent() {
+        GroupPolicy policy = GroupPolicy.builder().build();
+        GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy);
+
+        assertDoesNotThrow(() -> {
+            executor.close();
+            executor.close();
+            executor.close();
+        });
+    }
+
+    @Test
+    void testCancelInterruptsBlockedTask() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(1)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            CountDownLatch taskStarted = new CountDownLatch(1);
+            TaskHandle<String> handle = executor.submit("g", "blocked-task", () -> {
+                taskStarted.countDown();
+                Thread.sleep(10_000); // block for a long time
+                return "should not reach";
+            });
+
+            taskStarted.await(2, TimeUnit.SECONDS);
+            handle.cancel(true);
+
+            GroupResult<String> result = handle.await();
+            assertEquals(TaskStatus.CANCELLED, result.status());
+        }
+    }
+
+    @Test
+    void testResolverReturningZeroCoercedToOne() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder()
+                .concurrencyResolver(key -> 0)
+                .build();
+
+        assertEquals(1, policy.resolveConcurrency("any-group"));
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            TaskHandle<String> handle = executor.submit("any-group", "t-1", () -> "ok");
+            GroupResult<String> result = handle.await();
+            assertEquals(TaskStatus.SUCCESS, result.status());
+            assertEquals("ok", result.value());
+        }
+    }
+
+    @Test
+    void testResolverReturningNegativeCoercedToOne() {
+        GroupPolicy policy = GroupPolicy.builder()
+                .concurrencyResolver(key -> -5)
+                .build();
+
+        assertEquals(1, policy.resolveConcurrency("test-group"));
+    }
+
+    @Test
+    void testResolverThrowingFallsBackToDefault() {
+        GroupPolicy policy = GroupPolicy.builder()
+                .concurrencyResolver(key -> {
+                    throw new RuntimeException("resolver error");
+                })
+                .defaultMaxConcurrencyPerGroup(3)
+                .build();
+
+        assertEquals(3, policy.resolveConcurrency("any-group"));
+    }
+
+    @Test
+    void testGroupTaskNullValidation() {
+        assertThrows(NullPointerException.class, () -> new GroupTask<>(null, "t", () -> "v"));
+        assertThrows(NullPointerException.class, () -> new GroupTask<>("g", null, () -> "v"));
+        assertThrows(NullPointerException.class, () -> new GroupTask<>("g", "t", null));
+    }
+
+    @Test
+    void testBuilderDefensiveCopy() throws Exception {
+        HashMap<String, Integer> mutableMap = new HashMap<>();
+        mutableMap.put("g1", 3);
+
+        GroupPolicy policy = GroupPolicy.builder()
+                .perGroupMaxConcurrency(mutableMap)
+                .build();
+
+        // Mutate the original map after build
+        mutableMap.put("g1", 999);
+        mutableMap.put("g2", 5);
+
+        // Policy should not be affected by mutation
+        assertEquals(3, policy.resolveConcurrency("g1"));
+        // g2 should fall back to default (1), not 5
+        assertEquals(1, policy.resolveConcurrency("g2"));
+
+        // Also test perGroupMaxInFlight defensive copy
+        HashMap<String, Integer> mutableInFlight = new HashMap<>();
+        mutableInFlight.put("g1", 10);
+
+        GroupPolicy policy2 = GroupPolicy.builder()
+                .perGroupMaxInFlight(mutableInFlight)
+                .build();
+
+        mutableInFlight.put("g1", 999);
+        assertEquals(10, policy2.resolveMaxInFlight("g1"));
+    }
+
+    @Test
+    void testHighConcurrencyStress() throws Exception {
+        int groupCount = 10;
+        int tasksPerGroup = 100;
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(5)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            List<TaskHandle<String>> handles = new ArrayList<>();
+            AtomicInteger completedCount = new AtomicInteger();
+
+            for (int g = 0; g < groupCount; g++) {
+                String group = "stress-group-" + g;
+                for (int t = 0; t < tasksPerGroup; t++) {
+                    String taskId = group + "-task-" + t;
+                    handles.add(executor.submit(group, taskId, () -> {
+                        Thread.sleep(1); // minimal work
+                        completedCount.incrementAndGet();
+                        return "done";
+                    }));
+                }
+            }
+
+            // Wait for all tasks to complete
+            int successCount = 0;
+            for (TaskHandle<String> handle : handles) {
+                GroupResult<String> result = handle.await();
+                if (result.status() == TaskStatus.SUCCESS) {
+                    successCount++;
+                }
+            }
+
+            assertEquals(groupCount * tasksPerGroup, successCount,
+                    "all tasks should complete successfully");
+            assertEquals(groupCount * tasksPerGroup, completedCount.get());
+        }
+    }
+
+    // ==================== Phase 3: Feature Tests ====================
+
+    @Test
+    void testTaskHandleAwaitWithTimeout() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(1)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            TaskHandle<String> handle = executor.submit("g", "slow-task", () -> {
+                Thread.sleep(5_000);
+                return "done";
+            });
+
+            // Timeout should produce CANCELLED result with TimeoutException
+            GroupResult<String> result = handle.await(50, TimeUnit.MILLISECONDS);
+            assertEquals(TaskStatus.CANCELLED, result.status());
+            assertInstanceOf(TimeoutException.class, result.error());
+
+            // The underlying task should still be running (not cancelled)
+            // Cancel it to clean up
+            handle.cancel(true);
+        }
+    }
+
+    @Test
+    void testTaskHandleJoinWithTimeout() {
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(1)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            TaskHandle<String> handle = executor.submit("g", "slow-task", () -> {
+                Thread.sleep(5_000);
+                return "done";
+            });
+
+            GroupResult<String> result = handle.join(50, TimeUnit.MILLISECONDS);
+            assertEquals(TaskStatus.CANCELLED, result.status());
+            assertInstanceOf(TimeoutException.class, result.error());
+
+            handle.cancel(true);
+        }
+    }
+
+    @Test
+    void testToCompletableFuture() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder().build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            TaskHandle<String> handle = executor.submit("g", "cf-task", () -> "hello");
+            CompletableFuture<GroupResult<String>> cf = handle.toCompletableFuture();
+
+            GroupResult<String> result = cf.get(5, TimeUnit.SECONDS);
+            assertEquals(TaskStatus.SUCCESS, result.status());
+            assertEquals("hello", result.value());
+        }
+    }
+
+    @Test
+    void testEvictGroup() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(1)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            // Submit and complete a task for group "evict-test"
+            TaskHandle<String> handle1 = executor.submit("evict-test", "t-1", () -> "first");
+            assertEquals(TaskStatus.SUCCESS, handle1.await().status());
+
+            // Evict the group
+            executor.evictGroup("evict-test");
+
+            // New tasks should still work (resources recreated)
+            TaskHandle<String> handle2 = executor.submit("evict-test", "t-2", () -> "second");
+            GroupResult<String> result = handle2.await();
+            assertEquals(TaskStatus.SUCCESS, result.status());
+            assertEquals("second", result.value());
+        }
+    }
+
+    @Test
+    void testTaskLifecycleListener() throws Exception {
+        AtomicInteger submitted = new AtomicInteger();
+        AtomicInteger started = new AtomicInteger();
+        AtomicInteger completed = new AtomicInteger();
+        AtomicBoolean completedSuccess = new AtomicBoolean(false);
+
+        TaskLifecycleListener listener = new TaskLifecycleListener() {
+            @Override
+            public void onSubmitted(String groupKey, String taskId) {
+                submitted.incrementAndGet();
+            }
+
+            @Override
+            public void onStarted(String groupKey, String taskId) {
+                started.incrementAndGet();
+            }
+
+            @Override
+            public void onCompleted(String groupKey, String taskId, GroupResult<?> result) {
+                completed.incrementAndGet();
+                if (result.status() == TaskStatus.SUCCESS) {
+                    completedSuccess.set(true);
+                }
+            }
+        };
+
+        GroupPolicy policy = GroupPolicy.builder()
+                .taskLifecycleListener(listener)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            TaskHandle<String> handle = executor.submit("g", "t-1", () -> "ok");
+            handle.await();
+        }
+
+        assertEquals(1, submitted.get());
+        assertEquals(1, started.get());
+        assertEquals(1, completed.get());
+        assertTrue(completedSuccess.get());
+    }
+
+    @Test
+    void testTaskLifecycleListenerExceptionIsSilent() throws Exception {
+        TaskLifecycleListener throwingListener = new TaskLifecycleListener() {
+            @Override
+            public void onSubmitted(String groupKey, String taskId) {
+                throw new RuntimeException("listener error");
+            }
+
+            @Override
+            public void onStarted(String groupKey, String taskId) {
+                throw new RuntimeException("listener error");
+            }
+
+            @Override
+            public void onCompleted(String groupKey, String taskId, GroupResult<?> result) {
+                throw new RuntimeException("listener error");
+            }
+        };
+
+        GroupPolicy policy = GroupPolicy.builder()
+                .taskLifecycleListener(throwingListener)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            // Should not throw despite listener exceptions
+            TaskHandle<String> handle = executor.submit("g", "t-1", () -> "ok");
+            GroupResult<String> result = handle.await();
+            assertEquals(TaskStatus.SUCCESS, result.status());
+            assertEquals("ok", result.value());
+        }
+    }
+
+    @Test
+    void testGracefulShutdownWithTimeout() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(2)
+                .build();
+
+        GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy);
+
+        // Submit a fast task
+        TaskHandle<String> handle = executor.submit("g", "t-1", () -> "done");
+        handle.await();
+
+        // Shutdown with generous timeout — should return true
+        boolean completed = executor.shutdown(java.time.Duration.ofSeconds(5));
+        assertTrue(completed, "should complete within timeout");
     }
 }

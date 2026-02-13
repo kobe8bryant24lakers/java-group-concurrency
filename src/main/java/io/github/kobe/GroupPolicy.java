@@ -19,6 +19,7 @@ public final class GroupPolicy {
     private final int globalMaxInFlight;
     private final int defaultMaxInFlightPerGroup;
     private final Map<String, Integer> perGroupMaxInFlight;
+    private final TaskLifecycleListener taskLifecycleListener;
 
     private GroupPolicy(Builder builder) {
         this.perGroupMaxConcurrency = builder.perGroupMaxConcurrency == null
@@ -31,6 +32,7 @@ public final class GroupPolicy {
         this.perGroupMaxInFlight = builder.perGroupMaxInFlight == null
                 ? Collections.emptyMap()
                 : Collections.unmodifiableMap(new HashMap<>(builder.perGroupMaxInFlight));
+        this.taskLifecycleListener = builder.taskLifecycleListener;
     }
 
     /**
@@ -100,6 +102,10 @@ public final class GroupPolicy {
         return perGroupMaxInFlight;
     }
 
+    public TaskLifecycleListener taskLifecycleListener() {
+        return taskLifecycleListener;
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -111,6 +117,7 @@ public final class GroupPolicy {
         private int globalMaxInFlight = Integer.MAX_VALUE;
         private int defaultMaxInFlightPerGroup = Integer.MAX_VALUE;
         private Map<String, Integer> perGroupMaxInFlight;
+        private TaskLifecycleListener taskLifecycleListener;
 
         private Builder() {
         }
@@ -119,7 +126,7 @@ public final class GroupPolicy {
          * Set per-group overrides (copied defensively).
          */
         public Builder perGroupMaxConcurrency(Map<String, Integer> perGroupMaxConcurrency) {
-            this.perGroupMaxConcurrency = perGroupMaxConcurrency;
+            this.perGroupMaxConcurrency = perGroupMaxConcurrency == null ? null : new HashMap<>(perGroupMaxConcurrency);
             return this;
         }
 
@@ -159,7 +166,15 @@ public final class GroupPolicy {
          * Set per-group max in-flight overrides (copied defensively).
          */
         public Builder perGroupMaxInFlight(Map<String, Integer> perGroupMaxInFlight) {
-            this.perGroupMaxInFlight = perGroupMaxInFlight;
+            this.perGroupMaxInFlight = perGroupMaxInFlight == null ? null : new HashMap<>(perGroupMaxInFlight);
+            return this;
+        }
+
+        /**
+         * Set a lifecycle listener for task events.
+         */
+        public Builder taskLifecycleListener(TaskLifecycleListener taskLifecycleListener) {
+            this.taskLifecycleListener = taskLifecycleListener;
             return this;
         }
 

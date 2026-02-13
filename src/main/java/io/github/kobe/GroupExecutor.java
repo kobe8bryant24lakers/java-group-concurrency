@@ -8,9 +8,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.time.Duration;
 
 /**
  * Executes tasks grouped by a groupKey with per-group concurrency control using virtual threads.
@@ -58,6 +61,7 @@ public final class GroupExecutor implements AutoCloseable {
         Objects.requireNonNull(taskId, "taskId");
         Objects.requireNonNull(task, "task");
 
+        fireOnSubmitted(groupKey, taskId);
         ExecutorService groupExecutor = executorManager.executorFor(groupKey);
         var future = groupExecutor.submit(() -> executeWithIsolation(groupKey, taskId, task));
         return new TaskHandle<>(groupKey, taskId, future);
@@ -109,11 +113,16 @@ public final class GroupExecutor implements AutoCloseable {
             bulkheadAcquired = true;
             semaphore.acquire();                 // Layer 3: per-group concurrency
             semaphoreAcquired = true;
-            return executeTask(groupKey, taskId, task, startNanos);
+            fireOnStarted(groupKey, taskId);
+            GroupResult<T> result = executeTask(groupKey, taskId, task, startNanos);
+            fireOnCompleted(groupKey, taskId, result);
+            return result;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             long end = System.nanoTime();
-            return GroupResult.cancelled(groupKey, taskId, e, startNanos, end);
+            GroupResult<T> result = GroupResult.cancelled(groupKey, taskId, e, startNanos, end);
+            fireOnCompleted(groupKey, taskId, result);
+            return result;
         } finally {
             if (semaphoreAcquired) semaphore.release();
             if (bulkheadAcquired) bulkhead.release();
@@ -150,6 +159,8 @@ public final class GroupExecutor implements AutoCloseable {
     public void shutdown() {
         if (closed.compareAndSet(false, true)) {
             executorManager.close();
+            semaphoreManager.clear();
+            bulkheadManager.clear();
         }
     }
 
@@ -158,9 +169,67 @@ public final class GroupExecutor implements AutoCloseable {
         shutdown();
     }
 
+    /**
+     * Graceful shutdown with timeout. Initiates shutdown, waits up to the specified duration,
+     * then forces shutdown if tasks are still running.
+     *
+     * @param timeout max time to wait for tasks to complete
+     * @return true if all tasks completed before the timeout, false if forced shutdown was needed
+     */
+    public boolean shutdown(Duration timeout) {
+        if (closed.compareAndSet(false, true)) {
+            boolean completed = executorManager.awaitTermination(timeout);
+            semaphoreManager.clear();
+            bulkheadManager.clear();
+            return completed;
+        }
+        return true;
+    }
+
+    /**
+     * Evict all cached resources for the given group. The executor, semaphore, and bulkhead
+     * for this group will be removed and recreated on next use.
+     */
+    public void evictGroup(String groupKey) {
+        Objects.requireNonNull(groupKey, "groupKey");
+        executorManager.evict(groupKey);
+        semaphoreManager.evict(groupKey);
+        bulkheadManager.evict(groupKey);
+    }
+
     private void ensureOpen() {
         if (closed.get()) {
             throw new IllegalStateException("executor is shut down");
+        }
+    }
+
+    private void fireOnSubmitted(String groupKey, String taskId) {
+        TaskLifecycleListener listener = policy.taskLifecycleListener();
+        if (listener != null) {
+            try {
+                listener.onSubmitted(groupKey, taskId);
+            } catch (RuntimeException ignored) {
+            }
+        }
+    }
+
+    private void fireOnStarted(String groupKey, String taskId) {
+        TaskLifecycleListener listener = policy.taskLifecycleListener();
+        if (listener != null) {
+            try {
+                listener.onStarted(groupKey, taskId);
+            } catch (RuntimeException ignored) {
+            }
+        }
+    }
+
+    private void fireOnCompleted(String groupKey, String taskId, GroupResult<?> result) {
+        TaskLifecycleListener listener = policy.taskLifecycleListener();
+        if (listener != null) {
+            try {
+                listener.onCompleted(groupKey, taskId, result);
+            } catch (RuntimeException ignored) {
+            }
         }
     }
 }

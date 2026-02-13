@@ -1,8 +1,10 @@
 package io.github.kobe.internal;
 
+import java.time.Duration;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Manages per-group virtual thread executors for fault isolation.
@@ -18,14 +20,51 @@ public final class GroupExecutorManager implements AutoCloseable {
     }
 
     public void shutdownGroup(String groupKey) {
-        ExecutorService ex = executorByGroup.remove(groupKey);
-        if (ex != null) {
-            ex.shutdownNow();
+        executorByGroup.compute(groupKey, (key, existing) -> {
+            if (existing != null) existing.shutdownNow();
+            return null;
+        });
+    }
+
+    public void evict(String groupKey) {
+        shutdownGroup(groupKey);
+    }
+
+    /**
+     * Graceful shutdown with timeout: first call shutdown() on all executors, wait up to timeout,
+     * then shutdownNow() on any that did not terminate.
+     *
+     * @return true if all executors terminated within the timeout
+     */
+    public boolean awaitTermination(Duration timeout) {
+        executorByGroup.values().forEach(ExecutorService::shutdown);
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        boolean allTerminated = true;
+        for (ExecutorService executor : executorByGroup.values()) {
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0) {
+                allTerminated = false;
+                executor.shutdownNow();
+            } else {
+                try {
+                    if (!executor.awaitTermination(remainingNanos, TimeUnit.NANOSECONDS)) {
+                        allTerminated = false;
+                        executor.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    allTerminated = false;
+                    executor.shutdownNow();
+                }
+            }
         }
+        executorByGroup.clear();
+        return allTerminated;
     }
 
     @Override
     public void close() {
-        executorByGroup.values().forEach(ExecutorService::shutdown);
+        executorByGroup.values().forEach(ExecutorService::shutdownNow);
+        executorByGroup.clear();
     }
 }
