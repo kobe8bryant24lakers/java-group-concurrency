@@ -20,4 +20,13 @@ public interface TaskLifecycleListener {
      * Called when a task completes (successfully, with failure, or cancelled).
      */
     default void onCompleted(String groupKey, String taskId, GroupResult<?> result) {}
+
+    /**
+     * Called when a task is rejected because the queue threshold has been exceeded.
+     *
+     * @param groupKey the group key of the rejected task
+     * @param taskId   the task id of the rejected task
+     * @param reason   description of why the task was rejected
+     */
+    default void onRejected(String groupKey, String taskId, String reason) {}
 }

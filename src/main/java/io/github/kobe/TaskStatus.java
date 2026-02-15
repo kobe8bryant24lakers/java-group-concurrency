@@ -6,5 +6,6 @@ package io.github.kobe;
 public enum TaskStatus {
     SUCCESS,
     FAILED,
-    CANCELLED
+    CANCELLED,
+    REJECTED
 }

@@ -5,7 +5,7 @@ package io.github.kobe;
  *
  * @param groupKey        group identifier
  * @param taskId          caller supplied id
- * @param status          SUCCESS / FAILED / CANCELLED
+ * @param status          SUCCESS / FAILED / CANCELLED / REJECTED
  * @param value           result when successful, otherwise {@code null}
  * @param error           failure or cancellation cause, otherwise {@code null}
  * @param startTimeNanos  start timestamp from {@link System#nanoTime()}
@@ -39,5 +39,10 @@ public record GroupResult<T>(
     public static <T> GroupResult<T> cancelled(String groupKey, String taskId, Throwable error,
                                                long startTimeNanos, long endTimeNanos) {
         return new GroupResult<>(groupKey, taskId, TaskStatus.CANCELLED, null, error, startTimeNanos, endTimeNanos);
+    }
+
+    public static <T> GroupResult<T> rejected(String groupKey, String taskId) {
+        long now = System.nanoTime();
+        return new GroupResult<>(groupKey, taskId, TaskStatus.REJECTED, null, null, now, now);
     }
 }
