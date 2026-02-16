@@ -67,12 +67,17 @@ Semaphores are acquired in order (1 -> 2 -> 3) and released in reverse to preven
                   | acquire() done → release global queue permit
                   v
         +-------------------------------+
+        | Per-Group Queue Threshold     |  tryAcquire() -- reject if full
+        +-------------------------------+
+                        |
+                        v
+        +-------------------------------+
         | Layer 2: Per-Group Bulkhead   |
         | caps queued + running tasks   |
         | per group (maxInFlightPerGrp) |
         +-------------------------------+
-                        |
-                        v
+                  | acquire() done → release per-group queue permit
+                  v
         +-------------------------------+
         | Per-Group Queue Threshold     |  tryAcquire() -- reject if full
         +-------------------------------+
@@ -89,14 +94,16 @@ Semaphores are acquired in order (1 -> 2 -> 3) and released in reverse to preven
               per-group virtual thread
 ```
 
-> Queue threshold checks use an optimistic strategy: the protection-layer semaphore is tried non-blocking first (`tryAcquire()`). Only when the permit is not immediately available does the queue threshold check kick in. This means threshold=0 correctly allows tasks that don't need to wait.
+> Queue threshold checks use an optimistic strategy: each protection-layer semaphore is tried non-blocking first (`tryAcquire()`). Only when the permit is not immediately available does the queue threshold check kick in. This applies to both Layer 2 (bulkhead) and Layer 3 (concurrency), preventing tasks from piling up at either layer. A threshold of 0 correctly allows tasks that don't need to wait.
+
+> When a task is rejected, all previously acquired permits (global in-flight, bulkhead) are released **before** the rejection handler or policy is invoked. This means `CALLER_RUNS` tasks execute without holding any isolation permits.
 
 | Component | Scope | Default | Purpose |
 |-----------|-------|---------|---------|
 | Global Queue | Global | `Integer.MAX_VALUE` (off) | Limit tasks waiting for Layer 1 |
 | Layer 1 | Global | `Integer.MAX_VALUE` | Prevent system-wide overload |
+| Per-Group Queue | Per-group | `Integer.MAX_VALUE` (off) | Limit tasks waiting for Layer 2 and Layer 3 |
 | Layer 2 | Per-group | `Integer.MAX_VALUE` | Limit queued + running tasks per group |
-| Per-Group Queue | Per-group | `Integer.MAX_VALUE` (off) | Limit tasks waiting for Layer 3 |
 | Layer 3 | Per-group | `1` | Limit actual concurrency per group |
 
 ---
@@ -133,9 +140,11 @@ GroupPolicy policy = GroupPolicy.builder()
     .build();
 ```
 
-**Concurrency resolution priority:** `perGroupMaxConcurrency` > `concurrencyResolver` > `defaultMaxConcurrencyPerGroup`. Any non-positive value is coerced to 1. Concurrency is resolved once per group on first use ("first resolution fixed" strategy).
+**Concurrency resolution priority:** `perGroupMaxConcurrency` > `concurrencyResolver` > `defaultMaxConcurrencyPerGroup`. Non-positive values from a dynamic `concurrencyResolver` are coerced to 1 at resolution time. Concurrency is resolved once per group on first use ("first resolution fixed" strategy).
 
-**Queue threshold resolution priority:** `perGroupQueueThreshold` > `defaultQueueThresholdPerGroup`. Values < 0 are coerced to 0. A value of 0 means no waiting is allowed -- tasks that cannot immediately acquire a concurrency permit are rejected.
+**Queue threshold resolution priority:** `perGroupQueueThreshold` > `defaultQueueThresholdPerGroup`. A value of 0 means no waiting is allowed -- tasks that cannot immediately acquire a permit at Layer 2 or Layer 3 are rejected.
+
+**Builder validation:** The builder throws `IllegalArgumentException` on `build()` for invalid values: concurrency < 1, in-flight < 1, or queue threshold < 0. This applies to all direct builder fields and per-group map values, catching configuration errors early.
 
 Builder performs **defensive copies** of all mutable Map arguments.
 
@@ -198,7 +207,7 @@ result.taskId()        // "task-1"
 result.status()        // SUCCESS | FAILED | CANCELLED | REJECTED
 result.value()         // non-null on SUCCESS
 result.error()         // non-null on FAILED or CANCELLED
-result.durationNanos() // execution time in nanoseconds
+result.durationNanos() // pure execution time in nanoseconds (excludes queuing/permit wait)
 ```
 
 ### TaskLifecycleListener
@@ -239,8 +248,8 @@ TaskLifecycleListener listener = new TaskLifecycleListener() {
 | `await(timeout)` / `join(timeout)` times out | `CANCELLED` result with `TimeoutException` (task continues) |
 | Queue threshold exceeded (ABORT) | `RejectedTaskException` thrown; `executeAll()` collects as `REJECTED` result |
 | Queue threshold exceeded (DISCARD) | `REJECTED` result returned silently |
-| Queue threshold exceeded (CALLER_RUNS) | Task executed directly in the virtual thread, bypassing concurrency permits |
-| Custom `RejectionHandler` configured | Handler called on rejection (overrides `RejectionPolicy`) |
+| Queue threshold exceeded (CALLER_RUNS) | All held permits released first, then task executed directly in the virtual thread |
+| Custom `RejectionHandler` configured | Handler called on rejection (overrides `RejectionPolicy`); all held permits released first |
 | Listener throws exception | Silently caught and ignored |
 | Concurrency resolver throws exception | Falls back to `defaultMaxConcurrencyPerGroup` |
 | `submit()` / `executeAll()` after shutdown | `IllegalStateException` |
@@ -357,6 +366,7 @@ List<GroupResult<String>> results = executor.executeAll(tasks);
 
 - `GroupExecutor` is safe for concurrent `submit()` and `executeAll()` calls.
 - Semaphore and executor caches use `ConcurrentHashMap` with atomic operations.
+- `evictGroup()` uses a per-group `ReentrantReadWriteLock` (write lock) to atomically evict all resources, while `submit()` and resource lookups use read locks for consistency.
 - Shutdown is idempotent via `AtomicBoolean`.
 - `shutdownGroup()` uses atomic `ConcurrentHashMap.compute()` to prevent race conditions.
 

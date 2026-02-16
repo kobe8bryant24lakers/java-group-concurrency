@@ -73,17 +73,22 @@ GroupExecutor
 ├── static newVirtualThreadExecutor(GroupPolicy) → GroupExecutor
 ├── <T> submit(groupKey, taskId, Callable<T>) → TaskHandle<T>
 ├── <T> executeAll(List<GroupTask<T>>) → List<GroupResult<T>>
-├── shutdown()
+├── shutdownGroup(groupKey)
+├── evictGroup(groupKey)
+├── shutdown() / shutdown(Duration) → boolean
 └── close()  [AutoCloseable]
 ```
 
 **关键实现细节：**
 
 - 私有构造器 + 静态工厂方法，确保只能通过 `newVirtualThreadExecutor` 创建
-- 内部持有 `ExecutorService`（virtual-thread-per-task）、`GroupSemaphoreManager`、`GroupPolicy`
+- 内部持有 `GroupExecutorManager`（per-group virtual-thread executor）、`GroupSemaphoreManager`（Layer 3）、`GroupBulkheadManager`（Layer 2）、`GroupQueueManager`（队列阈值）、`GroupPolicy`
 - `AtomicBoolean closed` 保证 shutdown 的幂等性和线程安全
-- `submit()` 将任务包装为 `executeWithSemaphore()`，投递到虚拟线程执行
+- `submit()` 在 per-group 读锁保护下查找 executor，将任务包装为 `executeWithIsolation()` 投递到虚拟线程执行
+- `executeWithIsolation()` 在 per-group 读锁保护下查找 semaphore/bulkhead/queue 资源，确保与 `evictGroup()` 的原子性
+- `evictGroup()` 持 per-group 写锁，原子地驱逐所有缓存资源（executor、semaphore、bulkhead、queue）
 - `executeAll()` 先批量提交所有任务，再逐一 `await()` 收集结果，**不 fail-fast**
+- 被拒绝的任务在调用 rejection handler/policy **之前**释放所有已持有的 permits
 
 #### GroupPolicy
 
@@ -111,9 +116,10 @@ GroupPolicy
 ```
 
 **健壮性规则：**
-- 所有来源得到的并发度通过 `sanitize()` 处理：`raw >= 1 ? raw : 1`，非法值纠正为 1
+- Builder 的 `build()` 方法对直接配置值进行严格验证：concurrency < 1、in-flight < 1、queue threshold < 0 均抛出 `IllegalArgumentException`，尽早暴露配置错误
+- 动态 `concurrencyResolver` 返回值通过 `sanitize()` 处理：`raw >= 1 ? raw : 1`，非法值纠正为 1（因为无法控制用户函数的返回值）
 - `concurrencyResolver` 抛出异常时静默捕获，降级到默认值，避免整个批次崩溃
-- 构造时对 `perGroupMaxConcurrency` 做防御性拷贝 + `unmodifiableMap`
+- 构造时对 `perGroupMaxConcurrency`、`perGroupMaxInFlight`、`perGroupQueueThreshold` 做防御性拷贝 + `unmodifiableMap`
 
 #### GroupTask\<T\>
 
@@ -134,12 +140,14 @@ record GroupResult<T>(groupKey, taskId, status, value, error, startTimeNanos, en
 ├── durationNanos() → long
 ├── static success(...)
 ├── static failed(...)
-└── static cancelled(...)
+├── static cancelled(...)
+└── static rejected(...)
 ```
 
 - `status` 为 `SUCCESS` 时 `value` 有值、`error` 为 null
 - `status` 为 `FAILED`/`CANCELLED` 时 `value` 为 null、`error` 记录原因
-- 时间戳使用 `System.nanoTime()`，支持精确耗时计算
+- `status` 为 `REJECTED` 时 `value` 和 `error` 均为 null，`durationNanos()` 为 0
+- 时间戳使用 `System.nanoTime()`，`startTimeNanos` 在所有 permits 获取之后捕获，因此 `durationNanos()` 反映纯执行时间（不含排队等待时间）
 
 #### TaskHandle\<T\>
 
@@ -149,19 +157,25 @@ record GroupResult<T>(groupKey, taskId, status, value, error, startTimeNanos, en
 TaskHandle<T>
 ├── groupKey() → String
 ├── taskId() → String
-├── await() → GroupResult<T>       [throws InterruptedException]
-├── join() → GroupResult<T>        [不抛受检异常]
+├── await() → GroupResult<T>                          [throws InterruptedException]
+├── await(timeout, unit) → GroupResult<T>              [throws InterruptedException]
+├── join() → GroupResult<T>                            [不抛受检异常]
+├── join(timeout, unit) → GroupResult<T>               [不抛受检异常]
 ├── cancel(mayInterrupt) → boolean
-└── isDone() → boolean
+├── isDone() → boolean
+└── toCompletableFuture() → CompletableFuture<GroupResult<T>>
 ```
 
 - `await()`：等待完成，`CancellationException` 转为 CANCELLED 结果，`ExecutionException` 解包
+- `await(timeout, unit)`：带超时等待，超时返回 CANCELLED 结果（error 为 `TimeoutException`），不自动取消底层任务
 - `join()`：await 的无受检异常版本，中断时返回 CANCELLED 结果并恢复中断标记
+- `join(timeout, unit)`：带超时的 join 版本
+- `toCompletableFuture()`：通过虚拟线程桥接到 `CompletableFuture`
 
 #### TaskStatus
 
 ```
-enum TaskStatus { SUCCESS, FAILED, CANCELLED }
+enum TaskStatus { SUCCESS, FAILED, CANCELLED, REJECTED }
 ```
 
 ### 4.2 内部实现（`io.github.kobe.internal`）
@@ -197,19 +211,31 @@ GroupSemaphoreManager
     └── 4. 返回 TaskHandle(groupKey, taskId, future)
 
 Virtual Thread 内部执行：
-    executeWithSemaphore(groupKey, taskId, callable)
+    executeWithIsolation(groupKey, taskId, callable)
         │
-        ├── 1. semaphoreManager.semaphoreFor(groupKey)
-        │       → 获取（或惰性创建）该组的 Semaphore
-        ├── 2. semaphore.acquire()
-        │       → 获取许可（可能阻塞等待同组其他任务完成）
-        ├── 3. executeTask(groupKey, taskId, callable, startNanos)
+        ├── 0. 读锁保护下查找 bulkhead、semaphore、perGroupQueue
+        │
+        ├── 1. Layer 1: globalInFlightSemaphore.tryAcquire()
+        │       → 成功：继续 │ 失败：检查 global queue threshold → 阻塞等待
+        │
+        ├── 2. Layer 2: bulkhead.tryAcquire()
+        │       → 成功：继续 │ 失败：检查 per-group queue threshold → 阻塞等待
+        │       → 被拒绝时先释放 global permit
+        │
+        ├── 3. Layer 3: semaphore.tryAcquire()
+        │       → 成功：继续 │ 失败：检查 per-group queue threshold → 阻塞等待
+        │       → 被拒绝时先释放 bulkhead + global permits
+        │
+        ├── 4. startNanos = System.nanoTime()  ← 仅在所有 permits 获取后捕获
+        │
+        ├── 5. executeTask(groupKey, taskId, callable, startNanos)
         │       ├── 成功 → GroupResult.success(...)
         │       ├── InterruptedException → 恢复中断 + GroupResult.cancelled(...)
         │       ├── CancellationException → GroupResult.cancelled(...)
         │       └── 其他异常 → GroupResult.failed(...)
-        └── 4. finally: semaphore.release()
-                → 归还许可（仅在 acquire 成功的情况下）
+        │
+        └── 6. finally: 逆序释放 semaphore → bulkhead → global
+                → 仅释放已成功 acquire 的许可
 ```
 
 ### 5.2 批量执行（executeAll）
@@ -260,39 +286,49 @@ Group "std" (Semaphore permits=1):
 | 共享状态 | 保护机制 | 说明 |
 |---------|---------|------|
 | `GroupExecutor.closed` | `AtomicBoolean` | shutdown 幂等，submit 时检查 |
+| `GroupExecutor.groupLocks` | `ConcurrentHashMap<String, ReentrantReadWriteLock>` | per-group 读写锁，确保 evictGroup 与 submit/executeWithIsolation 的原子性 |
 | `GroupSemaphoreManager.semaphoreByGroup` | `ConcurrentHashMap.computeIfAbsent` | 惰性创建保证每个 key 只创建一次 |
-| 各组的 `Semaphore` | Semaphore 自身线程安全 | acquire/release 原子操作 |
-| `GroupPolicy` 字段 | 不可变（构造后只读） | Map 为 unmodifiableMap |
+| `GroupBulkheadManager.bulkheadByGroup` | `ConcurrentHashMap.computeIfAbsent` | 同上 |
+| `GroupQueueManager.queueByGroup` | `ConcurrentHashMap.computeIfAbsent` | 同上 |
+| `GroupExecutorManager.executorByGroup` | `ConcurrentHashMap.computeIfAbsent` / `compute` | 惰性创建 + shutdownGroup 原子操作 |
+| 各组的 `Semaphore` | Semaphore 自身线程安全 | acquire/release 原子操作，均使用 fair 模式 |
+| `GroupPolicy` 字段 | 不可变（构造后只读） | Map 为 unmodifiableMap，Builder 做防御性拷贝 |
 | `GroupTask`, `GroupResult` | Java record（不可变） | 天然线程安全 |
 
 ## 7. 中断与取消语义
 
 ```
-中断发生点              │  处理方式
-────────────────────────┼──────────────────────────────────
-semaphore.acquire()     │  捕获 InterruptedException
-                        │  → 恢复中断标记
-                        │  → 返回 GroupResult.cancelled()
-                        │  → 不执行 release（未获取许可）
-────────────────────────┼──────────────────────────────────
-task.call() 内部        │  捕获 InterruptedException
-                        │  → 恢复中断标记
-                        │  → 返回 GroupResult.cancelled()
-                        │  → finally 中 release（已获取许可）
-────────────────────────┼──────────────────────────────────
-TaskHandle.cancel(true) │  委托 Future.cancel(true)
-                        │  → 中断底层虚拟线程
-                        │  → 触发上述路径之一
-────────────────────────┼──────────────────────────────────
-executeAll 调用线程中断  │  当前 await 抛 InterruptedException
-                        │  → 恢复中断标记
-                        │  → 当前 + 剩余任务标记 CANCELLED
-                        │  → 剩余 handle.cancel(true)
+中断发生点                │  处理方式
+──────────────────────────┼──────────────────────────────────
+Layer 1/2/3 acquire()     │  捕获 InterruptedException
+                          │  → 恢复中断标记
+                          │  → 返回 GroupResult.cancelled()
+                          │  → finally 仅释放已成功 acquire 的许可
+──────────────────────────┼──────────────────────────────────
+task.call() 内部          │  捕获 InterruptedException
+                          │  → 恢复中断标记
+                          │  → 返回 GroupResult.cancelled()
+                          │  → finally 中释放所有已获取的许可
+──────────────────────────┼──────────────────────────────────
+queue threshold 拒绝      │  先释放所有已持有的 permits
+                          │  → 调用 handleRejection
+                          │  → ABORT: 抛 RejectedTaskException
+                          │  → DISCARD: 返回 REJECTED 结果
+                          │  → CALLER_RUNS: 无 permits 下执行任务
+──────────────────────────┼──────────────────────────────────
+TaskHandle.cancel(true)   │  委托 Future.cancel(true)
+                          │  → 中断底层虚拟线程
+                          │  → 触发上述路径之一
+──────────────────────────┼──────────────────────────────────
+executeAll 调用线程中断    │  当前 await 抛 InterruptedException
+                          │  → 恢复中断标记
+                          │  → 当前 + 剩余任务标记 CANCELLED
+                          │  → 剩余 handle.cancel(true)
 ```
 
 ## 8. 测试策略
 
-4 个核心测试用例，覆盖主要功能维度：
+4 个核心测试用例（初始），覆盖主要功能维度：
 
 | 测试方法 | 验证目标 | 实现手段 |
 |---------|---------|---------|
@@ -305,29 +341,39 @@ executeAll 调用线程中断  │  当前 await 抛 InterruptedException
 
 ```
 io.github.kobe
-├── GroupExecutor.java           // 核心执行器（入口）
-├── GroupPolicy.java             // 并发策略（Builder）
-├── GroupTask.java               // 任务定义（record）
-├── GroupResult.java             // 执行结果（record）
-├── TaskHandle.java              // 提交句柄
-├── TaskStatus.java              // 状态枚举
+├── GroupExecutor.java             // 核心执行器（入口）
+├── GroupPolicy.java               // 并发策略 + 隔离策略（Builder，含构建时验证）
+├── GroupTask.java                 // 任务定义（record）
+├── GroupResult.java               // 执行结果（record，含 REJECTED 状态）
+├── TaskHandle.java                // 提交句柄（含超时 + CompletableFuture）
+├── TaskStatus.java                // 状态枚举（SUCCESS/FAILED/CANCELLED/REJECTED）
+├── TaskLifecycleListener.java     // 任务生命周期监听器接口
+├── RejectionPolicy.java           // 内置拒绝策略枚举（ABORT/DISCARD/CALLER_RUNS）
+├── RejectionHandler.java          // 自定义拒绝处理器接口
+├── RejectedTaskException.java     // 队列阈值超限异常
 └── internal/
-    └── GroupSemaphoreManager.java  // Semaphore 缓存管理
+    ├── GroupSemaphoreManager.java  // Layer 3: per-group 并发 Semaphore 管理（fair）
+    ├── GroupBulkheadManager.java   // Layer 2: per-group 在途 Semaphore 管理（fair）
+    ├── GroupExecutorManager.java   // Per-group 虚拟线程执行器管理
+    └── GroupQueueManager.java      // Per-group 队列阈值 Semaphore 管理
 
 io.github.kobe (test)
-└── GroupExecutorTest.java       // 4 个核心测试
+├── GroupExecutorTest.java         // 28 个测试（含并发控制、隔离、生命周期、验证）
+└── QueueThresholdTest.java        // 14 个测试（队列阈值 + 拒绝策略）
 ```
 
 ## 10. 设计约束与权衡
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
-| Semaphore 缓存策略 | 不自动清理 | 库假设 groupKey 规模可控；自动清理引入复杂性且可能导致并发度重新计算 |
+| Semaphore 缓存策略 | 不自动清理（支持手动 evict） | 库假设 groupKey 规模可控；`evictGroup()` 支持手动释放资源 |
 | 并发度变更策略 | 首次解析固定 | 简单稳定，避免运行中 Semaphore 许可数动态调整带来的复杂性和不可预测性 |
 | resolver 异常处理 | 静默降级到默认值 | 保证单个 resolver 异常不影响整个执行批次 |
-| 非法并发度处理 | 纠正为 1 | 比抛异常更宽容，保证系统始终可用 |
-| 执行器类型 | virtual-thread-per-task | 每个任务一个虚拟线程，天然匹配高并发场景，无需调参 |
+| 非法配置值处理 | Builder 阶段抛出 `IllegalArgumentException` | 尽早暴露配置错误；动态 resolver 返回值仍通过 sanitize 纠正为 1 |
+| 执行器类型 | per-group virtual-thread-per-task | 每组独立虚拟线程执行器，提供故障隔离和独立生命周期 |
 | fail-fast 策略 | 不 fail-fast | executeAll 收集全部结果，调用方可自行决定如何处理失败 |
+| evictGroup 一致性 | per-group ReadWriteLock | 写锁保护 evict，读锁保护资源查找，确保不出现新旧混合资源 |
+| 被拒绝任务的 permit 处理 | 先释放再 reject | CALLER_RUNS 不会占用隔离 permit，ABORT/DISCARD 也快速释放资源 |
 
 ---
 
@@ -517,29 +563,30 @@ public <T> TaskHandle<T> submit(String groupKey, String taskId, Callable<T> task
 }
 ```
 
-**执行方法变更** — 三层 Semaphore 按固定顺序获取/释放（避免死锁）：
+**执行方法变更** — 三层 Semaphore 按固定顺序获取/释放（避免死锁），支持队列阈值：
 
 ```java
 private <T> GroupResult<T> executeWithIsolation(String groupKey, String taskId, Callable<T> task) {
-    long startNanos = System.nanoTime();
-    boolean globalAcquired = false, bulkheadAcquired = false, semaphoreAcquired = false;
-    Semaphore bulkhead = bulkheadManager.bulkheadFor(groupKey);
-    Semaphore semaphore = semaphoreManager.semaphoreFor(groupKey);
+    // 读锁保护下查找 per-group 资源，确保与 evictGroup 的原子性
+    Semaphore bulkhead, semaphore, perGroupQueue;
+    readLock.lock();
+    try { bulkhead = ...; semaphore = ...; perGroupQueue = ...; }
+    finally { readLock.unlock(); }
+
     try {
-        globalInFlightSemaphore.acquire();   // Layer 1
-        globalAcquired = true;
-        bulkhead.acquire();                  // Layer 2
-        bulkheadAcquired = true;
-        semaphore.acquire();                 // Layer 3
-        semaphoreAcquired = true;
+        // Layer 1: tryAcquire → 失败则 global queue check → blocking acquire
+        // Layer 2: tryAcquire → 失败则 per-group queue check → blocking acquire
+        //          拒绝时先释放 global permit
+        // Layer 3: tryAcquire → 失败则 per-group queue check → blocking acquire
+        //          拒绝时先释放 bulkhead + global permits
+        long startNanos = System.nanoTime(); // 仅在所有 permits 获取后
         return executeTask(groupKey, taskId, task, startNanos);
     } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
-        return GroupResult.cancelled(groupKey, taskId, e, startNanos, System.nanoTime());
+        long now = System.nanoTime();
+        return GroupResult.cancelled(groupKey, taskId, e, now, now);
     } finally {
-        if (semaphoreAcquired)  semaphore.release();
-        if (bulkheadAcquired)   bulkhead.release();
-        if (globalAcquired)     globalInFlightSemaphore.release();
+        // 逆序释放：semaphore → bulkhead → global（仅释放已成功 acquire 的）
     }
 }
 ```
@@ -610,7 +657,7 @@ public void shutdown() {
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │              GroupResult<T> / TaskHandle<T>                               │
-│  status: SUCCESS / FAILED / CANCELLED                                    │
+│  status: SUCCESS / FAILED / CANCELLED / REJECTED                         │
 │  value / error / startTimeNanos / endTimeNanos                           │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -734,7 +781,7 @@ public interface TaskLifecycleListener {
 
 ### 12.3 测试覆盖
 
-总计 25 个测试（8 原有 + 17 新增）：
+总计 42 个测试（GroupExecutorTest 28 个 + QueueThresholdTest 14 个）：
 
 | 测试方法 | 验证内容 |
 |---------|---------|
@@ -766,9 +813,53 @@ io.github.kobe
 ├── GroupResult.java               // 执行结果（record）
 ├── TaskHandle.java                // 提交句柄（含超时 + CompletableFuture）
 ├── TaskStatus.java                // 状态枚举
-├── TaskLifecycleListener.java     // 任务生命周期监听器接口（新）
+├── TaskLifecycleListener.java     // 任务生命周期监听器接口
+├── RejectionPolicy.java           // 内置拒绝策略枚举
+├── RejectionHandler.java          // 自定义拒绝处理器接口
+├── RejectedTaskException.java     // 队列阈值超限异常
 └── internal/
     ├── GroupSemaphoreManager.java  // Layer 3: per-group 并发 Semaphore 管理（fair）
     ├── GroupBulkheadManager.java   // Layer 2: per-group 在途 Semaphore 管理（fair）
-    └── GroupExecutorManager.java   // Per-group 虚拟线程执行器管理
+    ├── GroupExecutorManager.java   // Per-group 虚拟线程执行器管理
+    └── GroupQueueManager.java      // Per-group 队列阈值 Semaphore 管理
 ```
+
+---
+
+## 13. Code Review 修复（并发安全加固 + 语义修正）
+
+基于全面 Code Review 发现并修复的问题：
+
+### 13.1 并发安全修复
+
+| 修复项 | 文件 | 描述 |
+|--------|------|------|
+| evictGroup 原子性 | `GroupExecutor.java` | 引入 per-group `ReentrantReadWriteLock`：`submit()` 和 `executeWithIsolation()` 持读锁查找资源，`evictGroup()` 持写锁执行驱逐，防止混合新旧资源导致 permit 泄漏 |
+| CALLER_RUNS 释放 permits | `GroupExecutor.java` | 在调用 `handleRejection()` 之前释放所有已持有的 global/bulkhead permits，使 CALLER_RUNS 不再占用隔离资源 |
+| Layer 2 队列阈值保护 | `GroupExecutor.java` | 对 bulkhead acquire 增加 try-then-check-threshold-then-block 模式（与 Layer 1/3 一致），防止任务在 Layer 2 无限堆积 |
+
+### 13.2 语义修正
+
+| 修复项 | 文件 | 描述 |
+|--------|------|------|
+| startTimeNanos 语义 | `GroupExecutor.java` | 将 `startNanos` 捕获移至所有 permits 获取之后，`durationNanos()` 现在反映纯执行时间（不含排队等待时间） |
+| Builder 参数验证 | `GroupPolicy.java` | `build()` 方法对无效参数（concurrency < 1、inFlight < 1、queueThreshold < 0）抛出 `IllegalArgumentException`，尽早暴露配置错误。动态 resolver 返回值仍通过 sanitize 纠正 |
+| rejectionHandler 优先级文档 | `GroupPolicy.java` | 在 Javadoc 中明确说明：当同时设置 handler 和 policy 时，handler 优先，policy 被忽略 |
+| awaitTermination 契约文档 | `GroupExecutorManager.java` | 添加 Javadoc 说明调用者必须先设置 closed 标志 |
+
+### 13.3 新增测试
+
+| 测试方法 | 验证内容 |
+|---------|---------|
+| `testBuilderRejectsInvalidValues` | Builder 对 9 种无效参数抛出 `IllegalArgumentException` |
+| `testBulkheadWaitRespectsQueueThreshold` | Layer 2 bulkhead 等待受 queue threshold 保护 |
+| `testCallerRunsDoesNotHoldPermits` | CALLER_RUNS 执行时不持有 global/bulkhead permits |
+
+### 13.4 文件变更汇总
+
+| 文件 | 变更行数 | 描述 |
+|------|---------|------|
+| `GroupExecutor.java` | +140/-17 | 新增 per-group ReadWriteLock、Layer 2 queue threshold、permit 释放逻辑 |
+| `GroupPolicy.java` | +41 | Builder 参数验证 + rejectionHandler 文档 |
+| `GroupExecutorManager.java` | +3 | awaitTermination 契约文档 |
+| `GroupExecutorTest.java` | +97 | 3 个新测试用例 |
