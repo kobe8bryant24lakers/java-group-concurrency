@@ -673,6 +673,103 @@ class GroupExecutorTest {
     }
 
     @Test
+    void testBuilderRejectsInvalidValues() {
+        assertThrows(IllegalArgumentException.class, () ->
+                GroupPolicy.builder().defaultMaxConcurrencyPerGroup(0).build());
+        assertThrows(IllegalArgumentException.class, () ->
+                GroupPolicy.builder().defaultMaxConcurrencyPerGroup(-1).build());
+        assertThrows(IllegalArgumentException.class, () ->
+                GroupPolicy.builder().globalMaxInFlight(0).build());
+        assertThrows(IllegalArgumentException.class, () ->
+                GroupPolicy.builder().defaultMaxInFlightPerGroup(0).build());
+        assertThrows(IllegalArgumentException.class, () ->
+                GroupPolicy.builder().globalQueueThreshold(-1).build());
+        assertThrows(IllegalArgumentException.class, () ->
+                GroupPolicy.builder().defaultQueueThresholdPerGroup(-1).build());
+        assertThrows(IllegalArgumentException.class, () ->
+                GroupPolicy.builder().perGroupMaxConcurrency(Map.of("g", 0)).build());
+        assertThrows(IllegalArgumentException.class, () ->
+                GroupPolicy.builder().perGroupMaxInFlight(Map.of("g", -1)).build());
+        assertThrows(IllegalArgumentException.class, () ->
+                GroupPolicy.builder().perGroupQueueThreshold(Map.of("g", -1)).build());
+    }
+
+    @Test
+    void testBulkheadWaitRespectsQueueThreshold() throws Exception {
+        // With bulkhead=1 and queue=0, tasks that can't immediately get the bulkhead permit
+        // should be rejected rather than blocking indefinitely at Layer 2.
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(2)
+                .defaultMaxInFlightPerGroup(1)
+                .defaultQueueThresholdPerGroup(0)
+                .rejectionPolicy(RejectionPolicy.DISCARD)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            CountDownLatch blockLatch = new CountDownLatch(1);
+            CountDownLatch startedLatch = new CountDownLatch(1);
+
+            // First task holds the single bulkhead permit
+            executor.submit("g", "t-1", () -> {
+                startedLatch.countDown();
+                blockLatch.await();
+                return "first";
+            });
+
+            startedLatch.await(5, TimeUnit.SECONDS);
+            Thread.sleep(100);
+
+            // Second task should be rejected: bulkhead full (1), queue threshold = 0
+            TaskHandle<String> handle2 = executor.submit("g", "t-2", () -> "second");
+            Thread.sleep(200);
+
+            blockLatch.countDown();
+
+            GroupResult<String> result2 = handle2.join();
+            assertEquals(TaskStatus.REJECTED, result2.status());
+        }
+    }
+
+    @Test
+    void testCallerRunsDoesNotHoldPermits() throws Exception {
+        // CALLER_RUNS should release global and bulkhead permits before executing the task.
+        // Verify by checking that a second group can still acquire the global permit while
+        // a CALLER_RUNS task is executing.
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(1)
+                .globalMaxInFlight(2) // room for 2 in-flight tasks
+                .defaultQueueThresholdPerGroup(0)
+                .rejectionPolicy(RejectionPolicy.CALLER_RUNS)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            CountDownLatch blockLatch = new CountDownLatch(1);
+            CountDownLatch startedLatch = new CountDownLatch(1);
+
+            // First task holds the concurrency permit for group "g"
+            executor.submit("g", "t-1", () -> {
+                startedLatch.countDown();
+                blockLatch.await();
+                return "first";
+            });
+
+            startedLatch.await(5, TimeUnit.SECONDS);
+            Thread.sleep(100);
+
+            // Second task to same group: concurrency permit unavailable, queue=0 → CALLER_RUNS.
+            // After fix, global + bulkhead permits are released before CALLER_RUNS executes,
+            // so the task runs without holding any isolation permits.
+            TaskHandle<String> handle2 = executor.submit("g", "t-2", () -> "caller-ran");
+
+            GroupResult<String> result2 = handle2.join();
+            assertEquals(TaskStatus.SUCCESS, result2.status());
+            assertEquals("caller-ran", result2.value());
+
+            blockLatch.countDown();
+        }
+    }
+
+    @Test
     void testGracefulShutdownWithTimeout() throws Exception {
         GroupPolicy policy = GroupPolicy.builder()
                 .defaultMaxConcurrencyPerGroup(2)

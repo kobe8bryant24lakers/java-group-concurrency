@@ -270,6 +270,7 @@ public final class GroupPolicy {
 
         /**
          * Set a custom rejection handler. When configured, takes priority over {@link RejectionPolicy}.
+         * If both a handler and a policy are set, the handler is invoked and the policy is ignored.
          */
         public Builder rejectionHandler(RejectionHandler rejectionHandler) {
             this.rejectionHandler = rejectionHandler;
@@ -277,6 +278,47 @@ public final class GroupPolicy {
         }
 
         public GroupPolicy build() {
+            if (defaultMaxConcurrencyPerGroup < 1) {
+                throw new IllegalArgumentException(
+                        "defaultMaxConcurrencyPerGroup must be >= 1, got: " + defaultMaxConcurrencyPerGroup);
+            }
+            if (globalMaxInFlight < 1) {
+                throw new IllegalArgumentException(
+                        "globalMaxInFlight must be >= 1, got: " + globalMaxInFlight);
+            }
+            if (defaultMaxInFlightPerGroup < 1) {
+                throw new IllegalArgumentException(
+                        "defaultMaxInFlightPerGroup must be >= 1, got: " + defaultMaxInFlightPerGroup);
+            }
+            if (globalQueueThreshold < 0) {
+                throw new IllegalArgumentException(
+                        "globalQueueThreshold must be >= 0, got: " + globalQueueThreshold);
+            }
+            if (defaultQueueThresholdPerGroup < 0) {
+                throw new IllegalArgumentException(
+                        "defaultQueueThresholdPerGroup must be >= 0, got: " + defaultQueueThresholdPerGroup);
+            }
+            if (perGroupMaxConcurrency != null) {
+                perGroupMaxConcurrency.forEach((k, v) -> {
+                    if (v == null || v < 1)
+                        throw new IllegalArgumentException(
+                                "perGroupMaxConcurrency value must be >= 1 for key: " + k);
+                });
+            }
+            if (perGroupMaxInFlight != null) {
+                perGroupMaxInFlight.forEach((k, v) -> {
+                    if (v == null || v < 1)
+                        throw new IllegalArgumentException(
+                                "perGroupMaxInFlight value must be >= 1 for key: " + k);
+                });
+            }
+            if (perGroupQueueThreshold != null) {
+                perGroupQueueThreshold.forEach((k, v) -> {
+                    if (v == null || v < 0)
+                        throw new IllegalArgumentException(
+                                "perGroupQueueThreshold value must be >= 0 for key: " + k);
+                });
+            }
             return new GroupPolicy(this);
         }
     }

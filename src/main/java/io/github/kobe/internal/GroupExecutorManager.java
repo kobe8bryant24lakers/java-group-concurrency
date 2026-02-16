@@ -33,6 +33,9 @@ public final class GroupExecutorManager implements AutoCloseable {
     /**
      * Graceful shutdown with timeout: first call shutdown() on all executors, wait up to timeout,
      * then shutdownNow() on any that did not terminate.
+     * <p>
+     * Note: callers must set a "closed" flag before invoking this method to prevent concurrent
+     * {@link #executorFor} calls from adding new executors that would miss the shutdown.
      *
      * @return true if all executors terminated within the timeout
      */

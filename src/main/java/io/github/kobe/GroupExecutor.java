@@ -9,11 +9,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.time.Duration;
 
 /**
@@ -29,6 +29,7 @@ public final class GroupExecutor implements AutoCloseable {
     private final Semaphore globalQueueSemaphore;       // null when no global queue threshold
     private final GroupQueueManager queueManager;        // null when no per-group queue threshold
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final ConcurrentHashMap<String, ReentrantReadWriteLock> groupLocks = new ConcurrentHashMap<>();
 
     private GroupExecutor(GroupPolicy policy,
                           GroupExecutorManager executorManager,
@@ -78,9 +79,15 @@ public final class GroupExecutor implements AutoCloseable {
         Objects.requireNonNull(task, "task");
 
         fireOnSubmitted(groupKey, taskId);
-        ExecutorService groupExecutor = executorManager.executorFor(groupKey);
-        var future = groupExecutor.submit(() -> executeWithIsolation(groupKey, taskId, task));
-        return new TaskHandle<>(groupKey, taskId, future);
+        ReentrantReadWriteLock.ReadLock readLock = lockFor(groupKey).readLock();
+        readLock.lock();
+        try {
+            ExecutorService groupExecutor = executorManager.executorFor(groupKey);
+            var future = groupExecutor.submit(() -> executeWithIsolation(groupKey, taskId, task));
+            return new TaskHandle<>(groupKey, taskId, future);
+        } finally {
+            readLock.unlock();
+        }
     }
 
     /**
@@ -118,15 +125,26 @@ public final class GroupExecutor implements AutoCloseable {
     }
 
     private <T> GroupResult<T> executeWithIsolation(String groupKey, String taskId, java.util.concurrent.Callable<T> task) {
-        long startNanos = System.nanoTime();
         boolean globalQueueAcquired = false;
         boolean globalAcquired = false;
         boolean bulkheadAcquired = false;
         boolean perGroupQueueAcquired = false;
         boolean semaphoreAcquired = false;
-        Semaphore bulkhead = bulkheadManager.bulkheadFor(groupKey);
-        Semaphore semaphore = semaphoreManager.semaphoreFor(groupKey);
-        Semaphore perGroupQueue = queueManager != null ? queueManager.queueSemaphoreFor(groupKey) : null;
+
+        // Look up per-group resources under read lock to ensure consistency with evictGroup
+        Semaphore bulkhead;
+        Semaphore semaphore;
+        Semaphore perGroupQueue;
+        ReentrantReadWriteLock.ReadLock readLock = lockFor(groupKey).readLock();
+        readLock.lock();
+        try {
+            bulkhead = bulkheadManager.bulkheadFor(groupKey);
+            semaphore = semaphoreManager.semaphoreFor(groupKey);
+            perGroupQueue = queueManager != null ? queueManager.queueSemaphoreFor(groupKey) : null;
+        } finally {
+            readLock.unlock();
+        }
+
         try {
             // Layer 1: global in-flight — try non-blocking first
             if (globalInFlightSemaphore.tryAcquire()) {
@@ -150,8 +168,30 @@ public final class GroupExecutor implements AutoCloseable {
                 }
             }
 
-            bulkhead.acquire();                  // Layer 2: per-group in-flight
-            bulkheadAcquired = true;
+            // Layer 2: per-group bulkhead — try non-blocking first
+            if (bulkhead.tryAcquire()) {
+                bulkheadAcquired = true;
+            } else {
+                // Need to wait — check per-group queue threshold
+                if (perGroupQueue != null) {
+                    if (!perGroupQueue.tryAcquire()) {
+                        // Release global permit before rejection — rejected tasks should not hold permits
+                        globalInFlightSemaphore.release();
+                        globalAcquired = false;
+                        return handleRejection(groupKey, taskId, task, "per-group queue threshold exceeded (bulkhead)");
+                    }
+                    perGroupQueueAcquired = true;
+                }
+
+                bulkhead.acquire();                  // Layer 2: blocking wait
+                bulkheadAcquired = true;
+
+                // Release per-group queue permit — task moved from "waiting" to "in-flight"
+                if (perGroupQueueAcquired) {
+                    perGroupQueue.release();
+                    perGroupQueueAcquired = false;
+                }
+            }
 
             // Layer 3: per-group concurrency — try non-blocking first
             if (semaphore.tryAcquire()) {
@@ -160,6 +200,11 @@ public final class GroupExecutor implements AutoCloseable {
                 // Need to wait — check per-group queue threshold
                 if (perGroupQueue != null) {
                     if (!perGroupQueue.tryAcquire()) {
+                        // Release bulkhead and global permits before rejection
+                        bulkhead.release();
+                        bulkheadAcquired = false;
+                        globalInFlightSemaphore.release();
+                        globalAcquired = false;
                         return handleRejection(groupKey, taskId, task, "per-group queue threshold exceeded");
                     }
                     perGroupQueueAcquired = true;
@@ -175,14 +220,16 @@ public final class GroupExecutor implements AutoCloseable {
                 }
             }
 
+            // Capture start time after all permits acquired — durationNanos reflects execution time only
+            long startNanos = System.nanoTime();
             fireOnStarted(groupKey, taskId);
             GroupResult<T> result = executeTask(groupKey, taskId, task, startNanos);
             fireOnCompleted(groupKey, taskId, result);
             return result;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            long end = System.nanoTime();
-            GroupResult<T> result = GroupResult.cancelled(groupKey, taskId, e, startNanos, end);
+            long now = System.nanoTime();
+            GroupResult<T> result = GroupResult.cancelled(groupKey, taskId, e, now, now);
             fireOnCompleted(groupKey, taskId, result);
             return result;
         } finally {
@@ -241,10 +288,14 @@ public final class GroupExecutor implements AutoCloseable {
 
     public void shutdown() {
         if (closed.compareAndSet(false, true)) {
+            // close() calls shutdownNow() on all executors (non-blocking). Running tasks still
+            // hold direct references to their semaphore objects and will release permits on
+            // completion. Clearing manager maps allows GC of idle entries once all tasks finish.
             executorManager.close();
             semaphoreManager.clear();
             bulkheadManager.clear();
             if (queueManager != null) queueManager.clear();
+            groupLocks.clear();
         }
     }
 
@@ -266,6 +317,7 @@ public final class GroupExecutor implements AutoCloseable {
             semaphoreManager.clear();
             bulkheadManager.clear();
             if (queueManager != null) queueManager.clear();
+            groupLocks.clear();
             return completed;
         }
         return true;
@@ -274,19 +326,32 @@ public final class GroupExecutor implements AutoCloseable {
     /**
      * Evict all cached resources for the given group. The executor, semaphore, and bulkhead
      * for this group will be removed and recreated on next use.
+     * <p>
+     * Uses a per-group write lock to ensure atomicity with respect to concurrent
+     * {@link #submit} and {@link #executeWithIsolation} calls for the same group.
      */
     public void evictGroup(String groupKey) {
         Objects.requireNonNull(groupKey, "groupKey");
-        executorManager.evict(groupKey);
-        semaphoreManager.evict(groupKey);
-        bulkheadManager.evict(groupKey);
-        if (queueManager != null) queueManager.evict(groupKey);
+        ReentrantReadWriteLock.WriteLock writeLock = lockFor(groupKey).writeLock();
+        writeLock.lock();
+        try {
+            executorManager.evict(groupKey);
+            semaphoreManager.evict(groupKey);
+            bulkheadManager.evict(groupKey);
+            if (queueManager != null) queueManager.evict(groupKey);
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     private void ensureOpen() {
         if (closed.get()) {
             throw new IllegalStateException("executor is shut down");
         }
+    }
+
+    private ReentrantReadWriteLock lockFor(String groupKey) {
+        return groupLocks.computeIfAbsent(groupKey, k -> new ReentrantReadWriteLock());
     }
 
     private void fireOnSubmitted(String groupKey, String taskId) {
