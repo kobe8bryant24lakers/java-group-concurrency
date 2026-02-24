@@ -50,7 +50,7 @@ Semaphores are acquired in order (Global → Bulkhead → Concurrency) and relea
 - **`GroupResult<T>`** — Immutable record with status, value/error, and nanosecond timing
 - **`TaskHandle<T>`** — Wraps `Future<GroupResult<T>>` with `await()`, `join()`, `cancel()`, `await(timeout, unit)`, `join(timeout, unit)`, and `toCompletableFuture()`
 - **`TaskStatus`** — Enum: `SUCCESS`, `FAILED`, `CANCELLED`, `REJECTED`
-- **`TaskLifecycleListener`** — Interface with `onSubmitted`, `onStarted`, `onCompleted`, `onRejected` callbacks. Exceptions are silently caught.
+- **`TaskLifecycleListener`** — Interface with `onSubmitted`, `onStarted`, `onCompleted`, `onRejected` callbacks. RuntimeExceptions are silently caught.
 - **`RejectionPolicy`** — Enum: `ABORT`, `DISCARD`, `CALLER_RUNS`
 - **`RejectionHandler`** — Custom rejection handler interface (overrides `RejectionPolicy` when both are set)
 - **`RejectedTaskException`** — Thrown when `ABORT` policy rejects a task
@@ -70,5 +70,5 @@ Semaphores are acquired in order (Global → Bulkhead → Concurrency) and relea
 - `shutdown()` clears all manager caches (executors, semaphores, bulkheads, queues, locks) to allow GC. Running tasks still hold direct semaphore references and release permits on completion.
 - `shutdownGroup()` uses atomic `ConcurrentHashMap.compute()` to prevent race conditions.
 - All semaphores (Layers 1-3) use fair mode to prevent starvation.
-- `CALLER_RUNS` rejection releases all held permits before executing the task.
+- `CALLER_RUNS` rejection releases all held permits before executing the task directly in the group executor's virtual thread (the thread running `executeWithIsolation`), not in the original thread that called `submit()`.
 - `durationNanos()` on `GroupResult` reflects pure execution time (startTimeNanos captured after all permits acquired).
