@@ -186,19 +186,27 @@ public final class GroupExecutor implements AutoCloseable {
                 bulkhead.acquire();                  // Layer 2: blocking wait
                 bulkheadAcquired = true;
 
-                // Release per-group queue permit — task moved from "waiting" to "in-flight"
-                if (perGroupQueueAcquired) {
-                    perGroupQueue.release();
-                    perGroupQueueAcquired = false;
-                }
+                // Intentionally do NOT release perGroupQueueAcquired here.
+                // The task is still in a "waiting" state (now waiting for Layer 3 concurrency).
+                // Releasing and re-acquiring would open a race window where another task steals
+                // the queue slot, causing this task to be spuriously rejected at Layer 3 despite
+                // already holding the bulkhead permit (violating monotonic progress guarantees).
+                // The slot will be released once the concurrency permit is acquired below.
             }
 
             // Layer 3: per-group concurrency — try non-blocking first
             if (semaphore.tryAcquire()) {
                 semaphoreAcquired = true;
+                // Task obtained execution permit immediately — release any queue slot held from
+                // a Layer 2 wait, since the task is no longer in the waiting state.
+                if (perGroupQueueAcquired) {
+                    perGroupQueue.release();
+                    perGroupQueueAcquired = false;
+                }
             } else {
-                // Need to wait — check per-group queue threshold
-                if (perGroupQueue != null) {
+                // Need to wait — check per-group queue threshold only if not already holding a
+                // slot from a Layer 2 wait (reuse the existing slot to avoid double-counting).
+                if (perGroupQueue != null && !perGroupQueueAcquired) {
                     if (!perGroupQueue.tryAcquire()) {
                         // Release bulkhead and global permits before rejection
                         bulkhead.release();
@@ -213,7 +221,7 @@ public final class GroupExecutor implements AutoCloseable {
                 semaphore.acquire();             // Layer 3: blocking wait
                 semaphoreAcquired = true;
 
-                // Release per-group queue permit — task moved from "waiting" to "executing"
+                // Task obtained execution permit — release the queue slot (from either layer).
                 if (perGroupQueueAcquired) {
                     perGroupQueue.release();
                     perGroupQueueAcquired = false;

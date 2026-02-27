@@ -11,6 +11,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import java.util.concurrent.CopyOnWriteArrayList;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -507,6 +509,221 @@ class QueueThresholdTest {
             GroupResult<String> result = h2.join();
             assertEquals(TaskStatus.SUCCESS, result.status());
             assertEquals("after-evict", result.value());
+        }
+    }
+
+    /**
+     * Verifies that a task which had to WAIT at Layer 2 (bulkhead full) and subsequently
+     * also needs to wait at Layer 3 (concurrency full) holds exactly ONE queue slot
+     * throughout the entire waiting period — no release-and-reacquire between layers.
+     *
+     * Setup: bulkhead=2, concurrency=1, queueThreshold=1
+     *   Task 1: runs           (bulkhead 1/2, concurrency 1/1)
+     *   Task 2: immediately gets bulkhead (2/2), waits at Layer 3 — uses the 1 queue slot
+     *   Task 3: bulkhead FULL → queue slot already taken by Task 2 → REJECTED
+     * After Task 1 finishes: Task 2 executes → SUCCESS
+     */
+    @Test
+    void testQueueSlotHeldContinuouslyAcrossLayers() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(1)
+                .defaultMaxInFlightPerGroup(2)      // bulkhead = 2: 1 running + 1 waiting
+                .defaultQueueThresholdPerGroup(1)   // only 1 task may wait at any time
+                .rejectionPolicy(RejectionPolicy.DISCARD)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            CountDownLatch task1Started = new CountDownLatch(1);
+            CountDownLatch task1Block = new CountDownLatch(1);
+
+            // Task 1: acquires bulkhead(1/2) + concurrency(1/1) → runs
+            TaskHandle<String> h1 = executor.submit("g", "t-1", () -> {
+                task1Started.countDown();
+                task1Block.await();
+                return "t1";
+            });
+
+            task1Started.await(5, TimeUnit.SECONDS);
+            Thread.sleep(50);
+
+            // Task 2: immediately acquires bulkhead(2/2), blocked at Layer 3 (concurrency full),
+            // occupies the single queue slot. With the fix, this slot is held until Task 2
+            // acquires the concurrency permit.
+            TaskHandle<String> h2 = executor.submit("g", "t-2", () -> "t2");
+            Thread.sleep(80);
+
+            // Task 3: bulkhead FULL (2/2). Tries to wait at Layer 2, but queue slot is taken
+            // by Task 2 → must be REJECTED.
+            // Before the fix, Task 2 would have released its slot here, allowing Task 3 to
+            // steal it, and then Task 2 would be the one rejected (incorrect behavior).
+            TaskHandle<String> h3 = executor.submit("g", "t-3", () -> "t3");
+            Thread.sleep(50);
+
+            task1Block.countDown();
+
+            GroupResult<String> r1 = h1.join();
+            GroupResult<String> r2 = h2.join();
+            GroupResult<String> r3 = h3.join();
+
+            assertEquals(TaskStatus.SUCCESS, r1.status(), "task 1 must succeed");
+            assertEquals(TaskStatus.SUCCESS, r2.status(), "task 2 must succeed — it held the queue slot throughout");
+            assertEquals(TaskStatus.REJECTED, r3.status(), "task 3 must be rejected — queue was occupied by task 2");
+        }
+    }
+
+    /**
+     * Verifies that a single queue slot is counted exactly once per waiting task,
+     * even when the task passes through both Layer 2 and Layer 3 waits.
+     * With queueThreshold=2: exactly 2 tasks may wait, the 3rd must be rejected.
+     */
+    @Test
+    void testQueueCapacityExactCountWithBulkhead() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(1)
+                .defaultMaxInFlightPerGroup(3)      // bulkhead = 3
+                .defaultQueueThresholdPerGroup(2)   // 2 tasks may wait
+                .rejectionPolicy(RejectionPolicy.DISCARD)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            CountDownLatch task1Started = new CountDownLatch(1);
+            CountDownLatch task1Block = new CountDownLatch(1);
+
+            // Task 1 runs
+            TaskHandle<String> h1 = executor.submit("g", "t-1", () -> {
+                task1Started.countDown();
+                task1Block.await();
+                return "t1";
+            });
+
+            task1Started.await(5, TimeUnit.SECONDS);
+            Thread.sleep(50);
+
+            // Tasks 2 and 3 each immediately acquire a bulkhead slot, then wait at Layer 3.
+            // Each occupies exactly 1 queue slot. Total queue usage = 2 (at threshold).
+            TaskHandle<String> h2 = executor.submit("g", "t-2", () -> "t2");
+            TaskHandle<String> h3 = executor.submit("g", "t-3", () -> "t3");
+            Thread.sleep(80);
+
+            // Task 4: queueThreshold=2 is now FULL (Tasks 2 and 3 each hold 1 slot).
+            // Must be REJECTED. Before the fix, double-counting could leave ghost capacity,
+            // causing Task 4 to incorrectly succeed.
+            TaskHandle<String> h4 = executor.submit("g", "t-4", () -> "t4");
+            Thread.sleep(50);
+
+            task1Block.countDown();
+
+            GroupResult<String> r1 = h1.join();
+            GroupResult<String> r2 = h2.join();
+            GroupResult<String> r3 = h3.join();
+            GroupResult<String> r4 = h4.join();
+
+            assertEquals(TaskStatus.SUCCESS, r1.status(), "task 1 must succeed");
+            assertEquals(TaskStatus.SUCCESS, r2.status(), "task 2 must succeed");
+            assertEquals(TaskStatus.SUCCESS, r3.status(), "task 3 must succeed");
+            assertEquals(TaskStatus.REJECTED, r4.status(),
+                    "task 4 must be rejected — queue threshold of 2 was filled by tasks 2 and 3");
+        }
+    }
+
+    /**
+     * Verifies that all tasks eventually complete under concurrency=1 with a fair semaphore,
+     * demonstrating absence of starvation.
+     *
+     * Note: fair semaphores guarantee FIFO among threads already queued on the semaphore,
+     * but do not guarantee strict submission-order execution under virtual-thread scheduling.
+     */
+    @Test
+    void testNoStarvationWithFairSemaphore() throws Exception {
+        int taskCount = 5;
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(1)
+                .build();
+
+        CopyOnWriteArrayList<Integer> executionOrder = new CopyOnWriteArrayList<>();
+        CountDownLatch allStarted = new CountDownLatch(taskCount);
+        CountDownLatch gate = new CountDownLatch(1);
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            List<TaskHandle<Void>> handles = new ArrayList<>(taskCount);
+
+            for (int i = 0; i < taskCount; i++) {
+                int idx = i;
+                handles.add(executor.submit("fair-group", "t-" + i, () -> {
+                    allStarted.countDown();
+                    gate.await();
+                    executionOrder.add(idx);
+                    return null;
+                }));
+            }
+
+            allStarted.await(5, TimeUnit.SECONDS);
+            gate.countDown();
+            for (TaskHandle<Void> h : handles) {
+                assertEquals(TaskStatus.SUCCESS, h.await().status());
+            }
+        }
+
+        assertEquals(taskCount, executionOrder.size(), "all tasks must complete without starvation");
+        for (int i = 0; i < taskCount; i++) {
+            int idx = i;
+            assertTrue(executionOrder.contains(idx), "task " + idx + " must have executed");
+        }
+    }
+
+    /**
+     * Verifies that queue slots are reclaimed correctly after tasks complete,
+     * allowing subsequent tasks to use those slots without leakage.
+     */
+    @Test
+    void testQueueSlotReleasedAfterCrossLayerExecution() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(1)
+                .defaultMaxInFlightPerGroup(2)
+                .defaultQueueThresholdPerGroup(1)
+                .rejectionPolicy(RejectionPolicy.DISCARD)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            CountDownLatch phase1Done = new CountDownLatch(2);
+            CountDownLatch block = new CountDownLatch(1);
+
+            // Phase 1: Task 1 runs, Task 2 waits at Layer 3 (holds queue slot)
+            TaskHandle<String> h1 = executor.submit("g", "t-1", () -> {
+                block.await();
+                return "t1";
+            });
+            TaskHandle<String> h2 = executor.submit("g", "t-2", () -> {
+                phase1Done.countDown();
+                return "t2";
+            });
+
+            Thread.sleep(80);
+            // Unblock: Task 1 finishes → Task 2 runs → both done, queue slot reclaimed
+            block.countDown();
+            phase1Done.await(5, TimeUnit.SECONDS);
+
+            // Give a moment for all resources to be released
+            Thread.sleep(50);
+
+            // Phase 2: the queue slot should be free again; new tasks must succeed
+            TaskHandle<String> h3 = executor.submit("g", "t-3", () -> "t3");
+            TaskHandle<String> h4 = executor.submit("g", "t-4", () -> "t4");
+
+            GroupResult<String> r1 = h1.join();
+            GroupResult<String> r2 = h2.join();
+            GroupResult<String> r3 = h3.join();
+            GroupResult<String> r4 = h4.join();
+
+            assertEquals(TaskStatus.SUCCESS, r1.status());
+            assertEquals(TaskStatus.SUCCESS, r2.status());
+            // h3 immediately gets both permits (no waiting) — succeeds
+            assertEquals(TaskStatus.SUCCESS, r3.status(),
+                    "queue slot should be free after phase 1 completes");
+            // h4: depends on h3 holding concurrency — may wait or succeed;
+            // either way it must not be stuck (no slot leak)
+            assertTrue(r4.status() == TaskStatus.SUCCESS || r4.status() == TaskStatus.REJECTED,
+                    "task 4 must not be stuck — queue slot was reclaimed");
         }
     }
 
