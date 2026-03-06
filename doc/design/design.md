@@ -119,9 +119,9 @@ GroupExecutor                               [implements AutoCloseable]
 
 **关键实现细节：**
 
-- `submit()` 在 per-group 读锁保护下获取组执行器，将任务包装为 `executeWithIsolation()` 提交至虚拟线程
+- `submit()` 在 per-group 读锁保护下获取组执行器，将任务包装为 `executeWithIsolation()` 提交至虚拟线程。若底层执行器已关闭（`RejectedExecutionException`），返回包含 `REJECTED` 结果的 `TaskHandle`，不泄漏原始异常
 - `executeWithIsolation()` 在 per-group 读锁保护下获取三层 Semaphore 引用（确保与 `evictGroup` 的一致性），然后执行三层获取逻辑
-- `evictGroup()` 持 per-group 写锁，原子地驱逐执行器、Semaphore、Bulkhead、QueueSemaphore 四类缓存
+- `evictGroup()` 持 per-group 写锁，原子地驱逐执行器、Semaphore、Bulkhead、QueueSemaphore 四类缓存；释放写锁后移除 `groupLocks` 中对应条目，防止长期运行时大量瞬态 groupKey 导致锁 Map 无限增长
 - `executeAll()` 先批量提交所有任务（全部投递虚拟线程），再逐一 `await()` 收集结果，**不 fail-fast**；仅当调用线程自身被中断时，取消剩余任务
 - 被拒绝任务在调用 rejection handler/policy **之前**必须释放所有已持有的 permits
 - `AtomicBoolean closed` 保证 `shutdown()` 的幂等性
@@ -164,6 +164,7 @@ GroupPolicy
 ```
 
 **Builder 构建时验证**（`build()` 抛出 `IllegalArgumentException`）：
+- `rejectionPolicy` 为 `null`
 - `defaultMaxConcurrencyPerGroup` < 1
 - `globalMaxInFlight` < 1 / `defaultMaxInFlightPerGroup` < 1
 - `globalQueueThreshold` < 0 / `defaultQueueThresholdPerGroup` < 0
@@ -354,8 +355,12 @@ GroupExecutorManager                       [implements AutoCloseable]
     ├── 3. fireOnSubmitted(groupKey, taskId)
     ├── 4. 读锁（per-group）
     │      └── executorManager.executorFor(groupKey)
-    └── 5. groupExecutor.submit(() -> executeWithIsolation(...))
-           → 返回 TaskHandle(groupKey, taskId, future)
+    ├── 5. groupExecutor.submit(() -> executeWithIsolation(...))
+    │      → 返回 TaskHandle(groupKey, taskId, future)
+    │
+    └── ⚠ RejectedExecutionException（执行器已关闭）
+           → fireOnRejected(groupKey, taskId, "executor shut down")
+           → 返回 TaskHandle 包装 CompletableFuture.completedFuture(GroupResult.rejected(...))
 
 虚拟线程内部 executeWithIsolation(groupKey, taskId, callable):
     │
@@ -465,7 +470,7 @@ Group "std" (Layer 3 permits=1, Layer 2 permits=2):
 | 共享状态 | 保护机制 | 说明 |
 |---------|---------|------|
 | `GroupExecutor.closed` | `AtomicBoolean` | shutdown 幂等，submit 时检查 |
-| `GroupExecutor.groupLocks` | `ConcurrentHashMap` 自身 + per-key `ReentrantReadWriteLock` | `evictGroup` 持写锁，`submit` / `executeWithIsolation` 持读锁，防止混用新旧资源 |
+| `GroupExecutor.groupLocks` | `ConcurrentHashMap` 自身 + per-key `ReentrantReadWriteLock` | `evictGroup` 持写锁，`submit` / `executeWithIsolation` 持读锁，防止混用新旧资源；`evictGroup` 完成后移除条目，后续操作通过 `computeIfAbsent` 惰性重建 |
 | `GroupSemaphoreManager.semaphoreByGroup` | `ConcurrentHashMap.computeIfAbsent` | 惰性创建，每个 key 只创建一次 |
 | `GroupBulkheadManager.bulkheadByGroup` | `ConcurrentHashMap.computeIfAbsent` | 同上 |
 | `GroupQueueManager.queueByGroup` | `ConcurrentHashMap.computeIfAbsent` | 同上 |
@@ -525,3 +530,14 @@ io.github.kobe (test)
 | CALLER_RUNS 线程语义 | 在组执行器的虚拟线程中执行，不持有任何 permits | 不阻塞其他任务，任务降级处理时不占用隔离资源 |
 | 全局/per-group 队列阈值 | 仅在显式配置时创建对应 Semaphore（null 跳过） | 避免对未启用此功能的场景产生任何额外开销 |
 | fair Semaphore 性能 | 轻微额外开销 | 相比非公平模式多一次 FIFO 队列操作；在虚拟线程场景下可忽略，公平性收益更重要 |
+
+## 11. 变更日志
+
+### 2026-03-06 — 代码审查修复
+
+| 变更 | 严重性 | 涉及文件 | 说明 |
+|------|--------|---------|------|
+| `submit()` 捕获 `RejectedExecutionException` | 严重 | `GroupExecutor.java` | 底层执行器在 `ensureOpen()` 与 `submit()` 之间被关闭时（通过 `shutdownGroup`、`evictGroup` 或与 `shutdown` 竞态），原来会泄漏原始异常。现在捕获该异常，触发 `onRejected` 回调，返回包含 `REJECTED` 结果的 `TaskHandle` |
+| `evictGroup()` 清理 `groupLocks` 条目 | 中等 | `GroupExecutor.java` | 释放写锁后移除 `groupLocks` 中对应的 `ReentrantReadWriteLock` 条目，防止大量瞬态 groupKey 导致锁 Map 无限增长。后续操作通过 `computeIfAbsent` 惰性重建 |
+| `CALLER_RUNS` Javadoc 修正 | 中等 | `RejectionPolicy.java` | 原文档错误描述为"在调用方的虚拟线程中执行"，实际执行线程是组执行器的虚拟线程（运行 `executeWithIsolation` 的线程），已修正 |
+| Builder 增加 `rejectionPolicy` 空值校验 | 轻微 | `GroupPolicy.java` | `build()` 新增 `rejectionPolicy == null` 检查，抛出 `IllegalArgumentException`。此前若通过 setter 设为 null，会在 `handleRejection` 的 switch 表达式处抛出 `NullPointerException` |

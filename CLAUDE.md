@@ -38,13 +38,13 @@ Semaphores are acquired in order (Global → Bulkhead → Concurrency) and relea
 
 ### Key Classes (all in `io.github.kobe`)
 
-- **`GroupExecutor`** — Entry point. Factory method `newVirtualThreadExecutor(GroupPolicy)`. Submits individual tasks (`submit()`) or batches (`executeAll()`). Implements `AutoCloseable`. Supports `shutdown(Duration)` for graceful shutdown with timeout, `evictGroup(String)` for cache eviction, and `shutdownGroup(String)` for per-group shutdown.
+- **`GroupExecutor`** — Entry point. Factory method `newVirtualThreadExecutor(GroupPolicy)`. Submits individual tasks (`submit()`) or batches (`executeAll()`). Implements `AutoCloseable`. Supports `shutdown(Duration)` for graceful shutdown with timeout, `evictGroup(String)` for cache eviction (also cleans up per-group lock entries), and `shutdownGroup(String)` for per-group shutdown. `submit()` catches `RejectedExecutionException` from shut-down executors and returns a `REJECTED` TaskHandle.
 - **`GroupPolicy`** — Builder-configured concurrency policy with:
   - Three-tier concurrency resolution: `perGroupMaxConcurrency` > `concurrencyResolver` > `defaultMaxConcurrencyPerGroup`
   - Isolation config: `globalMaxInFlight`, `defaultMaxInFlightPerGroup`, `perGroupMaxInFlight`
   - Queue threshold config: `globalQueueThreshold`, `defaultQueueThresholdPerGroup`, `perGroupQueueThreshold`
   - Optional `TaskLifecycleListener` for task event callbacks
-  - Builder validates all parameters on `build()` — throws `IllegalArgumentException` for invalid values (concurrency < 1, inFlight < 1, queueThreshold < 0)
+  - Builder validates all parameters on `build()` — throws `IllegalArgumentException` for invalid values (concurrency < 1, inFlight < 1, queueThreshold < 0, rejectionPolicy null)
   - Builder performs defensive copies of mutable Map arguments
 - **`GroupTask<T>`** — Immutable record: `(groupKey, taskId, Callable<T>)`
 - **`GroupResult<T>`** — Immutable record with status, value/error, and nanosecond timing
@@ -66,7 +66,7 @@ Semaphores are acquired in order (Global → Bulkhead → Concurrency) and relea
 
 - Interrupts during `acquire()` or task execution restore the interrupt flag and produce a `CANCELLED` result.
 - Task submission, semaphore access, and executor state (`AtomicBoolean`) are all thread-safe.
-- `evictGroup()` uses a per-group `ReentrantReadWriteLock` (write lock) for atomicity; `submit()` and `executeWithIsolation()` use read locks for resource lookups.
+- `evictGroup()` uses a per-group `ReentrantReadWriteLock` (write lock) for atomicity; `submit()` and `executeWithIsolation()` use read locks for resource lookups. After eviction, the per-group lock entry is removed from `groupLocks` to prevent unbounded growth.
 - `shutdown()` clears all manager caches (executors, semaphores, bulkheads, queues, locks) to allow GC. Running tasks still hold direct semaphore references and release permits on completion.
 - `shutdownGroup()` uses atomic `ConcurrentHashMap.compute()` to prevent race conditions.
 - All semaphores (Layers 1-3) use fair mode to prevent starvation.

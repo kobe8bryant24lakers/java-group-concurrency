@@ -9,8 +9,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -85,6 +87,13 @@ public final class GroupExecutor implements AutoCloseable {
             ExecutorService groupExecutor = executorManager.executorFor(groupKey);
             var future = groupExecutor.submit(() -> executeWithIsolation(groupKey, taskId, task));
             return new TaskHandle<>(groupKey, taskId, future);
+        } catch (RejectedExecutionException e) {
+            // The underlying executor was shut down between ensureOpen() and the submit() call
+            // (e.g., via shutdownGroup(), evictGroup(), or a race with shutdown()).
+            // Return a handle wrapping a REJECTED result instead of leaking the exception.
+            fireOnRejected(groupKey, taskId, "executor shut down");
+            return new TaskHandle<>(groupKey, taskId,
+                    CompletableFuture.completedFuture(GroupResult.rejected(groupKey, taskId)));
         } finally {
             readLock.unlock();
         }
@@ -350,6 +359,9 @@ public final class GroupExecutor implements AutoCloseable {
         } finally {
             writeLock.unlock();
         }
+        // Remove after releasing the write lock — subsequent operations will lazily recreate it.
+        // Safe because any concurrent submit() for this group will computeIfAbsent a new lock.
+        groupLocks.remove(groupKey);
     }
 
     private void ensureOpen() {

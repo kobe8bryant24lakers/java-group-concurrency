@@ -278,6 +278,9 @@ public final class GroupPolicy {
         }
 
         public GroupPolicy build() {
+            if (rejectionPolicy == null) {
+                throw new IllegalArgumentException("rejectionPolicy must not be null");
+            }
             if (defaultMaxConcurrencyPerGroup < 1) {
                 throw new IllegalArgumentException(
                         "defaultMaxConcurrencyPerGroup must be >= 1, got: " + defaultMaxConcurrencyPerGroup);
