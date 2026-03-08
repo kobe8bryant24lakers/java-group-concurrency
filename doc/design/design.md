@@ -94,8 +94,10 @@
 **释放顺序**：Concurrency → Bulkhead → Global（逆序，仅释放已成功获取的许可）
 
 **队列阈值**：Layer 1 和 Layer 2/3 各有可选的队列阈值 Semaphore。任务无法立即获取 permit 时，先非阻塞检查队列阈值：
-- 队列阈值未满 → 占用一个队列许可，阻塞等待 → 获取成功后释放队列许可
 - 队列阈值已满 → 立即释放所有已持有的 permits，调用拒绝处理逻辑
+- 队列阈值未满 → 占用一个队列许可，阻塞等待 → 获取成功后释放队列许可
+
+**per-group 队列许可的跨层持有**：Layer 2（bulkhead）阻塞等待时，获取的 per-group 队列许可在 Layer 2 获取成功后**不立即释放**，而是持续持有直到 Layer 3（concurrency）也成功获取为止。原因：若在 Layer 2 获取后、Layer 3 等待前先释放，另一个任务可能抢占该队列槽，导致本任务在 Layer 3 被拒绝（尽管已持有 bulkhead permit），违反单调进展保证。Layer 3 获取到并发许可后，队列许可才被释放。Layer 3 直接 tryAcquire 成功时，亦释放从 Layer 2 传递来的队列许可。若中断发生在 Layer 3 acquire 期间，finally 块负责释放仍持有的队列许可。
 
 ## 5. 类设计
 
@@ -378,14 +380,16 @@ GroupExecutorManager                       [implements AutoCloseable]
     │      失败 → perGroupQueue != null ?
     │               tryAcquire 失败 → 拒绝（释放 global → handleRejection）
     │               tryAcquire 成功 → bulkhead.acquire()（阻塞）
-    │                                → 释放 perGroupQueue
+    │                                → 【持续持有 perGroupQueue 许可，不释放】
+    │                                  （防止 Layer 3 等待期间被其他任务抢占队列槽）
     │
     ├── 3. Layer 3 per-group 并发 Semaphore
-    │      tryAcquire() 成功 → 继续
-    │      失败 → perGroupQueue != null ?
-    │               tryAcquire 失败 → 拒绝（释放 bulkhead + global → handleRejection）
-    │               tryAcquire 成功 → semaphore.acquire()（阻塞）
-    │                                → 释放 perGroupQueue
+    │      tryAcquire() 成功 → 释放 perGroupQueue（若从 Layer 2 持有）→ 继续
+    │      失败 → 已从 Layer 2 持有 perGroupQueue？
+    │               是 → 复用现有队列槽（不重新申请）→ semaphore.acquire()（阻塞）→ 释放 perGroupQueue
+    │               否 → perGroupQueue != null ?
+    │                      tryAcquire 失败 → 拒绝（释放 bulkhead + global → handleRejection）
+    │                      tryAcquire 成功 → semaphore.acquire()（阻塞）→ 释放 perGroupQueue
     │
     ├── 4. startNanos = System.nanoTime()  ← 仅在三层 permits 全部获取后捕获
     ├── 5. fireOnStarted(groupKey, taskId)
@@ -400,7 +404,7 @@ GroupExecutorManager                       [implements AutoCloseable]
     │
     └── finally（逆序释放，仅释放已成功获取的许可）
            semaphore.release() if semaphoreAcquired
-           perGroupQueue.release() if perGroupQueueAcquired   ← 理论上此时已释放
+           perGroupQueue.release() if perGroupQueueAcquired   ← 中断发生在 Layer 3 acquire 期间时仍可能持有
            bulkhead.release() if bulkheadAcquired
            globalInFlightSemaphore.release() if globalAcquired
            globalQueueSemaphore.release() if globalQueueAcquired
@@ -532,6 +536,13 @@ io.github.kobe (test)
 | fair Semaphore 性能 | 轻微额外开销 | 相比非公平模式多一次 FIFO 队列操作；在虚拟线程场景下可忽略，公平性收益更重要 |
 
 ## 11. 变更日志
+
+### 2026-03-07 — per-group 队列许可跨层持有 & 拒绝前显式释放许可
+
+| 变更 | 严重性 | 涉及文件 | 说明 |
+|------|--------|---------|------|
+| per-group 队列许可跨层持有 | 严重 | `GroupExecutor.java` | Layer 2（bulkhead）阻塞等待成功后不立即释放 per-group 队列许可，而是持续持有至 Layer 3（concurrency）获取完成。若提前释放，另一任务可能抢占队列槽，导致已持有 bulkhead permit 的任务在 Layer 3 被拒绝，违反单调进展保证。Layer 3 tryAcquire 成功时释放持有的槽；Layer 3 需要阻塞时，复用现有槽（不重新申请）直至 acquire 成功后释放 |
+| 拒绝前显式释放已持有的 permits | 严重 | `GroupExecutor.java` | 队列阈值触发拒绝时，在调用 `handleRejection` 之前显式将已持有的上层 permits 释放并将 acquired 标志置 false，而非仅依赖 finally 块。Layer 2 拒绝时释放 global permit；Layer 3 拒绝时释放 bulkhead + global permits |
 
 ### 2026-03-06 — 代码审查修复
 
