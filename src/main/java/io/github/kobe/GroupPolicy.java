@@ -7,8 +7,15 @@ import java.util.Objects;
 import java.util.function.ToIntFunction;
 
 /**
- * Defines how max concurrency is chosen for each groupKey.
- * <p>Priority: per-group override &gt; resolver &gt; default value.</p>
+ * Defines how max concurrency and queue capacity are chosen for each groupKey.
+ *
+ * <p>Concurrency priority: per-group override &gt; resolver &gt; default value.</p>
+ * <p>Queue threshold priority: per-group override &gt; default value.</p>
+ *
+ * <p>Note: {@code defaultMaxInFlightPerGroup}, {@code perGroupMaxInFlight}, and
+ * {@code resolveMaxInFlight()} have been removed. In-flight limiting is now implicit:
+ * tasks are either executing (holding a semaphore permit) or queued in the
+ * {@code LinkedBlockingQueue} whose capacity is controlled by {@code queueThreshold}.</p>
  */
 public final class GroupPolicy {
 
@@ -17,11 +24,8 @@ public final class GroupPolicy {
     private final int defaultMaxConcurrencyPerGroup;
 
     private final int globalMaxInFlight;
-    private final int defaultMaxInFlightPerGroup;
-    private final Map<String, Integer> perGroupMaxInFlight;
     private final TaskLifecycleListener taskLifecycleListener;
 
-    private final int globalQueueThreshold;
     private final int defaultQueueThresholdPerGroup;
     private final Map<String, Integer> perGroupQueueThreshold;
     private final RejectionPolicy rejectionPolicy;
@@ -34,12 +38,7 @@ public final class GroupPolicy {
         this.concurrencyResolver = builder.concurrencyResolver;
         this.defaultMaxConcurrencyPerGroup = sanitize(builder.defaultMaxConcurrencyPerGroup);
         this.globalMaxInFlight = sanitize(builder.globalMaxInFlight);
-        this.defaultMaxInFlightPerGroup = sanitize(builder.defaultMaxInFlightPerGroup);
-        this.perGroupMaxInFlight = builder.perGroupMaxInFlight == null
-                ? Collections.emptyMap()
-                : Collections.unmodifiableMap(new HashMap<>(builder.perGroupMaxInFlight));
         this.taskLifecycleListener = builder.taskLifecycleListener;
-        this.globalQueueThreshold = sanitizeQueue(builder.globalQueueThreshold);
         this.defaultQueueThresholdPerGroup = sanitizeQueue(builder.defaultQueueThresholdPerGroup);
         this.perGroupQueueThreshold = builder.perGroupQueueThreshold == null
                 ? Collections.emptyMap()
@@ -71,32 +70,16 @@ public final class GroupPolicy {
         return defaultMaxConcurrencyPerGroup;
     }
 
-    /**
-     * Resolve the max in-flight tasks for the given group key.
-     * Priority: per-group override &gt; default value.
-     *
-     * @param groupKey group identifier, must not be null
-     * @return max in-flight tasks &gt;= 1
-     */
-    public int resolveMaxInFlight(String groupKey) {
-        Objects.requireNonNull(groupKey, "groupKey");
-        Integer overridden = perGroupMaxInFlight.get(groupKey);
-        if (overridden != null) {
-            return sanitize(overridden);
-        }
-        return defaultMaxInFlightPerGroup;
-    }
-
     public int globalMaxInFlight() {
         return globalMaxInFlight;
     }
 
     /**
-     * Resolve the queue threshold for the given group key.
+     * Resolve the queue threshold (LinkedBlockingQueue capacity) for the given group key.
      * Priority: per-group override &gt; default value.
      *
      * @param groupKey group identifier, must not be null
-     * @return queue threshold &gt;= 0
+     * @return queue capacity &gt;= 0; {@link Integer#MAX_VALUE} means unbounded
      */
     public int resolveQueueThreshold(String groupKey) {
         Objects.requireNonNull(groupKey, "groupKey");
@@ -127,20 +110,8 @@ public final class GroupPolicy {
         return defaultMaxConcurrencyPerGroup;
     }
 
-    public int defaultMaxInFlightPerGroup() {
-        return defaultMaxInFlightPerGroup;
-    }
-
-    public Map<String, Integer> perGroupMaxInFlight() {
-        return perGroupMaxInFlight;
-    }
-
     public TaskLifecycleListener taskLifecycleListener() {
         return taskLifecycleListener;
-    }
-
-    public int globalQueueThreshold() {
-        return globalQueueThreshold;
     }
 
     public int defaultQueueThresholdPerGroup() {
@@ -168,10 +139,7 @@ public final class GroupPolicy {
         private ToIntFunction<String> concurrencyResolver;
         private int defaultMaxConcurrencyPerGroup = 1;
         private int globalMaxInFlight = Integer.MAX_VALUE;
-        private int defaultMaxInFlightPerGroup = Integer.MAX_VALUE;
-        private Map<String, Integer> perGroupMaxInFlight;
         private TaskLifecycleListener taskLifecycleListener;
-        private int globalQueueThreshold = Integer.MAX_VALUE;
         private int defaultQueueThresholdPerGroup = Integer.MAX_VALUE;
         private Map<String, Integer> perGroupQueueThreshold;
         private RejectionPolicy rejectionPolicy = RejectionPolicy.ABORT;
@@ -181,10 +149,11 @@ public final class GroupPolicy {
         }
 
         /**
-         * Set per-group overrides (copied defensively).
+         * Set per-group concurrency overrides (copied defensively).
          */
         public Builder perGroupMaxConcurrency(Map<String, Integer> perGroupMaxConcurrency) {
-            this.perGroupMaxConcurrency = perGroupMaxConcurrency == null ? null : new HashMap<>(perGroupMaxConcurrency);
+            this.perGroupMaxConcurrency = perGroupMaxConcurrency == null
+                    ? null : new HashMap<>(perGroupMaxConcurrency);
             return this;
         }
 
@@ -206,25 +175,10 @@ public final class GroupPolicy {
 
         /**
          * Set global max in-flight tasks across all groups.
+         * Tasks beyond this limit are rejected immediately (not queued).
          */
         public Builder globalMaxInFlight(int globalMaxInFlight) {
             this.globalMaxInFlight = globalMaxInFlight;
-            return this;
-        }
-
-        /**
-         * Set default max in-flight tasks per group.
-         */
-        public Builder defaultMaxInFlightPerGroup(int defaultMaxInFlightPerGroup) {
-            this.defaultMaxInFlightPerGroup = defaultMaxInFlightPerGroup;
-            return this;
-        }
-
-        /**
-         * Set per-group max in-flight overrides (copied defensively).
-         */
-        public Builder perGroupMaxInFlight(Map<String, Integer> perGroupMaxInFlight) {
-            this.perGroupMaxInFlight = perGroupMaxInFlight == null ? null : new HashMap<>(perGroupMaxInFlight);
             return this;
         }
 
@@ -237,15 +191,8 @@ public final class GroupPolicy {
         }
 
         /**
-         * Set global queue threshold (max tasks waiting across all groups).
-         */
-        public Builder globalQueueThreshold(int globalQueueThreshold) {
-            this.globalQueueThreshold = globalQueueThreshold;
-            return this;
-        }
-
-        /**
-         * Set default queue threshold per group.
+         * Set default queue capacity per group (the LinkedBlockingQueue capacity).
+         * Tasks that cannot be dispatched and cannot fit in the queue are rejected.
          */
         public Builder defaultQueueThresholdPerGroup(int defaultQueueThresholdPerGroup) {
             this.defaultQueueThresholdPerGroup = defaultQueueThresholdPerGroup;
@@ -253,10 +200,11 @@ public final class GroupPolicy {
         }
 
         /**
-         * Set per-group queue threshold overrides (copied defensively).
+         * Set per-group queue capacity overrides (copied defensively).
          */
         public Builder perGroupQueueThreshold(Map<String, Integer> perGroupQueueThreshold) {
-            this.perGroupQueueThreshold = perGroupQueueThreshold == null ? null : new HashMap<>(perGroupQueueThreshold);
+            this.perGroupQueueThreshold = perGroupQueueThreshold == null
+                    ? null : new HashMap<>(perGroupQueueThreshold);
             return this;
         }
 
@@ -270,7 +218,6 @@ public final class GroupPolicy {
 
         /**
          * Set a custom rejection handler. When configured, takes priority over {@link RejectionPolicy}.
-         * If both a handler and a policy are set, the handler is invoked and the policy is ignored.
          */
         public Builder rejectionHandler(RejectionHandler rejectionHandler) {
             this.rejectionHandler = rejectionHandler;
@@ -289,14 +236,6 @@ public final class GroupPolicy {
                 throw new IllegalArgumentException(
                         "globalMaxInFlight must be >= 1, got: " + globalMaxInFlight);
             }
-            if (defaultMaxInFlightPerGroup < 1) {
-                throw new IllegalArgumentException(
-                        "defaultMaxInFlightPerGroup must be >= 1, got: " + defaultMaxInFlightPerGroup);
-            }
-            if (globalQueueThreshold < 0) {
-                throw new IllegalArgumentException(
-                        "globalQueueThreshold must be >= 0, got: " + globalQueueThreshold);
-            }
             if (defaultQueueThresholdPerGroup < 0) {
                 throw new IllegalArgumentException(
                         "defaultQueueThresholdPerGroup must be >= 0, got: " + defaultQueueThresholdPerGroup);
@@ -306,13 +245,6 @@ public final class GroupPolicy {
                     if (v == null || v < 1)
                         throw new IllegalArgumentException(
                                 "perGroupMaxConcurrency value must be >= 1 for key: " + k);
-                });
-            }
-            if (perGroupMaxInFlight != null) {
-                perGroupMaxInFlight.forEach((k, v) -> {
-                    if (v == null || v < 1)
-                        throw new IllegalArgumentException(
-                                "perGroupMaxInFlight value must be >= 1 for key: " + k);
                 });
             }
             if (perGroupQueueThreshold != null) {
