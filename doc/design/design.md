@@ -8,19 +8,38 @@
 - 数据库写入组最大 2 并发，读取组最大 8 并发
 - 不同 API endpoint 各自限流，同时防止单组任务量暴增拖垮全局
 
-核心语义：**按 groupKey 分组；组间并行；组内也并行，但组内最大并发度可控（1..N）；单组或全局的在途任务数可独立设上限；超限任务可配置拒绝策略。**
+核心语义：**按 groupKey 分组；组间并行；组内也并行，但组内最大并发度可控（1..N）；超限任务可配置排队或拒绝策略。**
+
+### 1.1 现状问题（驱动本次架构演进）
+
+初始实现采用"每任务一虚拟线程 + 信号量阻塞"模式：`submit()` 立即创建一个虚拟线程，该线程在三层 Semaphore 上阻塞等待许可。这带来以下问题：
+
+- **"排队"以阻塞线程形式存在**：提交 100 个任务但只有 2 个并发许可，意味着 98 个虚拟线程对象持续存在并阻塞在信号量上，而任务数据（Callable 等）本可作为轻量对象存储在队列中。
+- **资源可见性差**：无法直接查看排队中的任务列表，只能通过信号量等待计数间接反映。
+- **无法精确控制虚拟线程创建时机**：虚拟线程在任务提交时创建，而非在真正可以执行时创建。
+
+### 1.2 设计目标
+
+- 每组维护固定数量的并发虚拟线程（= `maxConcurrency`），超出并发数的任务以 Runnable 对象形式存入显式有界队列
+- 仅在任务被调度执行时才创建虚拟线程
+- 队列容量可独立配置；队列满时按拒绝策略处理
+
+---
 
 ## 2. 技术选型
 
 | 关注点 | 选型 | 理由 |
 |--------|------|------|
-| 线程模型 | JDK 21 Virtual Threads（per-group） | 轻量级，per-group 独立执行器提供逻辑故障隔离和独立生命周期 |
-| 并发控制 | `java.util.concurrent.Semaphore`（公平模式） | 精确控制许可数，fair=true 防止饥饿，acquire/release 语义天然匹配 |
+| 线程模型 | JDK 21 Virtual Threads（按需创建，非预分配） | 轻量级，仅在获得调度许可后才创建，避免阻塞态虚拟线程堆积 |
+| 并发控制 | `java.util.concurrent.Semaphore`（公平模式） | 精确控制同时执行的虚拟线程数，fair=true 防止饥饿 |
+| 任务排队 | `java.util.concurrent.LinkedBlockingQueue` | 显式有界队列，任务以 Runnable 对象形式排队，内存开销远低于阻塞线程 |
 | 缓存结构 | `ConcurrentHashMap` | 线程安全的惰性创建与缓存 |
 | 并发度配置 | 三级优先级策略 | 兼顾静态覆盖、动态计算和默认值的灵活性 |
 | 资源隔离 | `ReentrantReadWriteLock`（per-group） | 保证 evictGroup 与 submit 之间的资源一致性 |
 | 运行时依赖 | 无（纯 JDK 21） | 最小化引入，作为库不绑定任何第三方 |
 | 测试框架 | JUnit 5 | 仅测试作用域 |
+
+---
 
 ## 3. 整体架构
 
@@ -36,42 +55,37 @@
                              ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                       GroupExecutor                               │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │  Layer 1: Global In-Flight Semaphore (fair)                 │  │
-│  │  globalMaxInFlight（默认 Integer.MAX_VALUE = 无限制）         │  │
-│  └────────────────────────────┬───────────────────────────────┘  │
-│                               │                                  │
-│  ┌────────────────────────────▼───────────────────────────────┐  │
-│  │  GroupExecutorManager — Per-Group VirtualThread Executors   │  │
-│  │  "vip" → newVirtualThreadPerTaskExecutor()                  │  │
-│  │  "std" → newVirtualThreadPerTaskExecutor()   ...            │  │
-│  └────────────────────────────┬───────────────────────────────┘  │
-│                               │                                  │
-│  ┌────────────────────────────▼───────────────────────────────┐  │
-│  │  GroupBulkheadManager — Layer 2: Per-Group In-Flight (fair) │  │
-│  │  "vip" → Semaphore(maxInFlight, fair)                       │  │
-│  │  "std" → Semaphore(maxInFlight, fair)   ...                 │  │
-│  └────────────────────────────┬───────────────────────────────┘  │
-│                               │                                  │
-│  ┌────────────────────────────▼───────────────────────────────┐  │
-│  │  GroupSemaphoreManager — Layer 3: Per-Group Concurrency     │  │
-│  │  "vip" → Semaphore(4, fair)                                 │  │
-│  │  "std" → Semaphore(1, fair)   ...                           │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │  GroupQueueManager — Per-Group Queue Threshold Semaphore    │  │
-│  │  （仅在配置了 queueThreshold 时创建）                          │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │  GroupPolicy — 配置中心                                      │  │
-│  │  并发度 / 在途上限 / 队列阈值 / 拒绝策略 / 生命周期监听器       │  │
-│  └────────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  Layer 1: Global In-Flight Semaphore（可选，fair）            │  │
+│  │  globalMaxInFlight（默认 Integer.MAX_VALUE = 无限制）          │  │
+│  └────────────────────────────┬────────────────────────────────┘  │
+│                               │                                   │
+│  ┌────────────────────────────▼────────────────────────────────┐  │
+│  │  GroupStateManager — Per-Group State                         │  │
+│  │                                                              │  │
+│  │  "vip" → GroupState {                                        │  │
+│  │            Semaphore(4, fair)          ← 并发执行许可         │  │
+│  │            LinkedBlockingQueue(8)      ← 排队任务             │  │
+│  │          }                                                   │  │
+│  │  "std" → GroupState {                                        │  │
+│  │            Semaphore(1, fair)                                │  │
+│  │            LinkedBlockingQueue(∞)                            │  │
+│  │          }                          ...                      │  │
+│  │                                                              │  │
+│  │  调度逻辑（仅在许可可用时）：                                   │  │
+│  │    dispatchVirtualThread() → Thread.ofVirtual().start(task)  │  │
+│  │    onTaskDone() → 移交许可给队列中的下一个任务                  │  │
+│  │    tryDispatch() → 竞态兜底调度                               │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  GroupPolicy — 配置中心                                       │  │
+│  │  并发度 / 队列容量 / 全局在途 / 拒绝策略 / 生命周期监听器        │  │
+│  └─────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────┘
                              │
-                             ▼
+                             ▼（仅在获得许可时才创建虚拟线程）
 ┌──────────────────────────────────────────────────────────────────┐
 │              GroupResult<T> / TaskHandle<T>                       │
 │  status: SUCCESS / FAILED / CANCELLED / REJECTED                  │
@@ -79,25 +93,54 @@
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## 4. 三层防护机制
+---
 
-任务从提交到执行依次通过三层 Semaphore 保护。所有 Semaphore 均使用 `fair=true`（公平模式）以防止饥饿。
+## 4. 两层保护机制
 
-| 层级 | 名称 | 作用 | Semaphore 许可数 | 默认值 |
-|------|------|------|-----------------|--------|
-| Layer 1 | Global In-Flight | 全局在途任务总量上限 | `globalMaxInFlight` | `Integer.MAX_VALUE` |
-| Layer 2 | Per-Group Bulkhead | 单组在途任务上限，防止单组资源爆炸 | `resolveMaxInFlight(groupKey)` | `Integer.MAX_VALUE` |
-| Layer 3 | Per-Group Concurrency | 单组实际并发执行数上限 | `resolveConcurrency(groupKey)` | 由策略决定，最小为 1 |
+任务从提交到执行经过两层控制。所有 Semaphore 均使用 `fair=true`（公平模式）以防止饥饿。
 
-**获取顺序**：Global → Bulkhead → Concurrency（固定顺序，杜绝死锁）
+| 层级 | 名称 | 实现 | 许可数 | 默认值 |
+|------|------|------|--------|--------|
+| Layer 1 | Global In-Flight | 全局 `Semaphore`（可选）| `globalMaxInFlight` | `Integer.MAX_VALUE`（无限制） |
+| Per-Group | 并发 + 显式队列 | `Semaphore` + `LinkedBlockingQueue` | `resolveConcurrency(groupKey)` / `resolveQueueThreshold(groupKey)` | 由策略决定，最小并发 1，默认队列无界 |
 
-**释放顺序**：Concurrency → Bulkhead → Global（逆序，仅释放已成功获取的许可）
+### 4.1 调度机制
 
-**队列阈值**：Layer 1 和 Layer 2/3 各有可选的队列阈值 Semaphore。任务无法立即获取 permit 时，先非阻塞检查队列阈值：
-- 队列阈值已满 → 立即释放所有已持有的 permits，调用拒绝处理逻辑
-- 队列阈值未满 → 占用一个队列许可，阻塞等待 → 获取成功后释放队列许可
+任务提交时**不创建虚拟线程**，而是：
+1. 优先尝试直接获得执行许可（`semaphore.tryAcquire()`）→ 立即创建虚拟线程执行
+2. 无许可时尝试入队（`queue.offer(task)`）→ 等待后续调度
+3. 队列满时 → 拒绝
 
-**per-group 队列许可的跨层持有**：Layer 2（bulkhead）阻塞等待时，获取的 per-group 队列许可在 Layer 2 获取成功后**不立即释放**，而是持续持有直到 Layer 3（concurrency）也成功获取为止。原因：若在 Layer 2 获取后、Layer 3 等待前先释放，另一个任务可能抢占该队列槽，导致本任务在 Layer 3 被拒绝（尽管已持有 bulkhead permit），违反单调进展保证。Layer 3 获取到并发许可后，队列许可才被释放。Layer 3 直接 tryAcquire 成功时，亦释放从 Layer 2 传递来的队列许可。若中断发生在 Layer 3 acquire 期间，finally 块负责释放仍持有的队列许可。
+任务完成后采用**移交（hand-off）模式**：
+- 若队列非空 → 直接将当前许可移交给队首任务，无需 release/acquire 往返
+- 若队列为空 → 释放许可，并调用 `tryDispatch()` 处理提交与完成之间的竞态窗口
+
+```
+提交 → [semaphore.tryAcquire() 成功] → 立即创建虚拟线程执行
+     → [失败] → [queue.offer() 成功] → 等待调度 → tryDispatch()
+              → [失败，队列满] → REJECT
+
+完成 → [queue.poll() 非空] → 移交许可，创建虚拟线程执行下一个任务
+     → [空] → semaphore.release() → tryDispatch()
+```
+
+### 4.2 tryDispatch() 的必要性
+
+`tryDispatch()` 负责消除以下竞态窗口：
+
+**竞态场景**：任务 A 完成并调用 `queue.poll()` 返回空（队列此时确实为空），随后任务 B 的 `submit()` 调用 `semaphore.tryAcquire()` 失败（此时 A 尚未执行 `semaphore.release()`），B 将任务入队。A 随后执行 `semaphore.release()` 并调用 `tryDispatch()`，此时队列中已有 B 的任务，`tryDispatch()` 将其调度。
+
+若无 `tryDispatch()`，B 的任务将永远留在队列中（没有任何任务完成来触发调度）。
+
+### 4.3 Layer 1 与 per-group 的交互
+
+若配置了 `globalMaxInFlight`：
+- `submit()` 时先 `tryAcquire()` 全局信号量；失败则直接拒绝（不入队）
+- 任务完成后 `onTaskDone()` **无条件释放**完成任务的全局信号量许可（无论是否走移交路径）
+- 全局信号量许可在任务排队期间同样被占用（任务入队成功即已持有全局许可）
+- 移交路径中：完成任务释放自己的全局许可，队列中的下一个任务继续持有它入队时获得的全局许可——两者独立
+
+---
 
 ## 5. 类设计
 
@@ -112,20 +155,20 @@ GroupExecutor                               [implements AutoCloseable]
 ├── static newVirtualThreadExecutor(GroupPolicy) → GroupExecutor
 ├── <T> submit(groupKey, taskId, Callable<T>) → TaskHandle<T>
 ├── <T> executeAll(List<GroupTask<T>>) → List<GroupResult<T>>
-├── shutdownGroup(groupKey)                 // 原子关停单组执行器
+├── shutdownGroup(groupKey)                 // 原子关停单组，清空其队列
 ├── evictGroup(groupKey)                    // 驱逐单组所有缓存资源
 ├── shutdown()                              // 立即关闭，清理所有缓存
-├── shutdown(Duration timeout) → boolean    // 优雅关闭，超时后强制
+├── shutdown(Duration timeout) → boolean    // 优雅关闭，等待执行中任务完成
 └── close()                                 // 委托 shutdown()
 ```
 
 **关键实现细节：**
 
-- `submit()` 在 per-group 读锁保护下获取组执行器，将任务包装为 `executeWithIsolation()` 提交至虚拟线程。若底层执行器已关闭（`RejectedExecutionException`），返回包含 `REJECTED` 结果的 `TaskHandle`，不泄漏原始异常
-- `executeWithIsolation()` 在 per-group 读锁保护下获取三层 Semaphore 引用（确保与 `evictGroup` 的一致性），然后执行三层获取逻辑
-- `evictGroup()` 持 per-group 写锁，原子地驱逐执行器、Semaphore、Bulkhead、QueueSemaphore 四类缓存；释放写锁后移除 `groupLocks` 中对应条目，防止长期运行时大量瞬态 groupKey 导致锁 Map 无限增长
-- `executeAll()` 先批量提交所有任务（全部投递虚拟线程），再逐一 `await()` 收集结果，**不 fail-fast**；仅当调用线程自身被中断时，取消剩余任务
-- 被拒绝任务在调用 rejection handler/policy **之前**必须释放所有已持有的 permits
+- `submit()` 先检查 closed，再尝试 Layer 1 全局信号量（如有），再通过 `GroupStateManager` 进行 per-group 调度（tryAcquire → dispatch 或 queue.offer → tryDispatch）
+- 若队列满或全局信号量耗尽，调用 `handleRejection()` 处理拒绝
+- `evictGroup()` 持 per-group 写锁，原子地驱逐 `GroupState`（semaphore + queue）；释放写锁后移除 `groupLocks` 中对应条目，防止长期运行时大量瞬态 groupKey 导致锁 Map 无限增长
+- `executeAll()` 先批量提交所有任务，再逐一 `await()` 收集结果，**不 fail-fast**；仅当调用线程自身被中断时，取消剩余任务
+- 被拒绝任务在调用 rejection handler/policy **之前**必须释放所有已持有的 permits（包括 Layer 1 全局许可）
 - `AtomicBoolean closed` 保证 `shutdown()` 的幂等性
 - 生命周期事件（submitted / started / completed / rejected）在相应节点触发，捕获并静默忽略 `RuntimeException`
 
@@ -135,11 +178,9 @@ GroupExecutor                               [implements AutoCloseable]
 
 ```
 GroupPolicy
-├── resolveConcurrency(groupKey) → int (≥1)        // 三级解析
-├── resolveMaxInFlight(groupKey) → int (≥1)        // 两级解析
-├── globalMaxInFlight() → int
-├── resolveQueueThreshold(groupKey) → int (≥0)     // 两级解析
-├── globalQueueThreshold() → int
+├── resolveConcurrency(groupKey) → int (≥1)        // 三级解析 → Semaphore 许可数
+├── resolveQueueThreshold(groupKey) → int (≥0)     // 两级解析 → LinkedBlockingQueue 容量
+├── globalMaxInFlight() → int                       // Layer 1 全局信号量许可数
 ├── taskLifecycleListener() → TaskLifecycleListener
 ├── rejectionPolicy() → RejectionPolicy
 ├── rejectionHandler() → RejectionHandler
@@ -158,23 +199,31 @@ GroupPolicy
 3. defaultMaxConcurrencyPerGroup             ← 默认值（默认为 1）
 ```
 
-**在途上限两级解析优先级：**
+**队列容量两级解析优先级：**
 
 ```
-1. perGroupMaxInFlight.get(groupKey)    ← 显式 Map 覆盖
-2. defaultMaxInFlightPerGroup           ← 默认值（默认 Integer.MAX_VALUE）
+1. perGroupQueueThreshold.get(groupKey)    ← 显式 Map 覆盖
+2. defaultQueueThresholdPerGroup           ← 默认值（默认 Integer.MAX_VALUE = 无界队列）
 ```
+
+> **语义变化**：`queueThreshold` 在旧设计中是"阻塞前拒绝阈值"（通过额外 Semaphore 实现），在新设计中是 `LinkedBlockingQueue` 的容量上限，语义更直接。
+
+**移除的参数：**
+- `defaultMaxInFlightPerGroup`（已废弃）
+- `perGroupMaxInFlight`（已废弃）
+- `resolveMaxInFlight()`（已废弃）
+
+> 原 in-flight = 并发数 + 排队数。新设计中 in-flight 隐式等于 `maxConcurrency + queueCapacity`，无需单独配置。
 
 **Builder 构建时验证**（`build()` 抛出 `IllegalArgumentException`）：
 - `rejectionPolicy` 为 `null`
 - `defaultMaxConcurrencyPerGroup` < 1
-- `globalMaxInFlight` < 1 / `defaultMaxInFlightPerGroup` < 1
-- `globalQueueThreshold` < 0 / `defaultQueueThresholdPerGroup` < 0
+- `globalMaxInFlight` < 1
+- `defaultQueueThresholdPerGroup` < 0
 - `perGroupMaxConcurrency` 各值 < 1
-- `perGroupMaxInFlight` 各值 < 1
 - `perGroupQueueThreshold` 各值 < 0
 
-**Builder 防御性拷贝**：三个 Map 参数（`perGroupMaxConcurrency`、`perGroupMaxInFlight`、`perGroupQueueThreshold`）在 Builder setter 和构建时均做防御性拷贝，最终存储为 `unmodifiableMap`。
+**Builder 防御性拷贝**：Map 参数在 setter 和构建时均做防御性拷贝，最终存储为 `unmodifiableMap`。
 
 #### GroupTask\<T\>
 
@@ -206,11 +255,11 @@ record GroupResult<T>(groupKey, taskId, status, value, error, startTimeNanos, en
 | CANCELLED | null | InterruptedException / CancellationException / TimeoutException | 执行时间或 0 |
 | REJECTED | null | null | 0 |
 
-**`startTimeNanos` 在三层 permits 全部获取后才捕获**，因此 `durationNanos()` 反映纯执行时间，不含排队等待时间。
+**`startTimeNanos` 在 Semaphore 许可获取后、任务执行前捕获**，因此 `durationNanos()` 反映纯执行时间，不含排队等待时间。
 
 #### TaskHandle\<T\>
 
-已提交任务的句柄，包装 `Future<GroupResult<T>>`，包级私有构造器。
+已提交任务的句柄，包装 `CompletableFuture<GroupResult<T>>`，包级私有构造器。
 
 ```
 TaskHandle<T>
@@ -227,7 +276,7 @@ TaskHandle<T>
 - `await()`：等待完成，`CancellationException` 转为 CANCELLED 结果，`ExecutionException` 解包后重抛
 - `await(timeout, unit)`：超时返回 CANCELLED 结果（error 为 `TimeoutException`），**不自动取消底层任务**
 - `join()` / `join(timeout, unit)`：对应 await 的无受检异常版本，`InterruptedException` 恢复中断标记后返回 CANCELLED 结果
-- `toCompletableFuture()`：通过一个虚拟线程桥接 `Future` 到 `CompletableFuture`
+- `toCompletableFuture()`：直接返回内部 `CompletableFuture`（不再需要额外桥接线程）
 
 #### TaskStatus
 
@@ -241,8 +290,7 @@ enum TaskStatus { SUCCESS, FAILED, CANCELLED, REJECTED }
 enum RejectionPolicy {
     ABORT,        // 抛出 RejectedTaskException（默认）
     DISCARD,      // 静默返回 REJECTED 状态的 GroupResult
-    CALLER_RUNS   // 在组执行器的虚拟线程（executeWithIsolation 的当前线程）中执行任务，
-                  // 不持有任何 permits，不受并发控制约束
+    CALLER_RUNS   // 在调用 submit() 的线程中直接执行任务，不持有任何 permits
 }
 ```
 
@@ -273,7 +321,7 @@ RejectedTaskException extends RuntimeException
 ```java
 public interface TaskLifecycleListener {
     default void onSubmitted(String groupKey, String taskId) {}
-    default void onStarted(String groupKey, String taskId) {}         // 所有 permits 获取后
+    default void onStarted(String groupKey, String taskId) {}         // Semaphore 获取后、任务执行前
     default void onCompleted(String groupKey, String taskId, GroupResult<?> result) {}
     default void onRejected(String groupKey, String taskId, String reason) {}
 }
@@ -286,64 +334,41 @@ public interface TaskLifecycleListener {
 
 ### 5.2 内部实现（`io.github.kobe.internal`）
 
-#### GroupSemaphoreManager（Layer 3）
+#### GroupStateManager（新增，取代原 Layer 2/3 管理器）
 
-管理 per-group 并发 Semaphore 的惰性创建与缓存。
-
-```
-GroupSemaphoreManager
-├── semaphoreFor(groupKey) → Semaphore    // computeIfAbsent，fair=true
-├── knownGroupCount() → int
-├── clear()                               // 清空所有缓存（shutdown 时调用）
-└── evict(groupKey)                       // 移除单组缓存（evictGroup 时调用）
-```
-
-**"首次解析固定"策略**：groupKey 的 Semaphore 一旦创建，许可数不再改变。即使 `concurrencyResolver` 后续对同一 key 返回不同值，仍复用首次创建的 Semaphore。
-
-#### GroupBulkheadManager（Layer 2）
-
-管理 per-group 在途任务 Semaphore 的惰性创建与缓存。
+管理 per-group 并发状态（Semaphore + LinkedBlockingQueue）及调度逻辑。
 
 ```
-GroupBulkheadManager
-├── bulkheadFor(groupKey) → Semaphore     // computeIfAbsent，fair=true
-├── clear()
-└── evict(groupKey)
+GroupStateManager
+├── stateFor(groupKey) → GroupState        // computeIfAbsent，首次解析固定
+├── dispatch(state, task, listener)
+│     // 创建虚拟线程：执行任务 → fireOnStarted/Completed → onTaskDone()
+├── onTaskDone(state, globalSemaphore, listener)
+│     // 移交：queue.poll() 非空 → dispatch(next)
+│     //        空 → semaphore.release() → tryDispatch()
+├── tryDispatch(state, globalSemaphore, listener)
+│     // 竞态兜底：queue 非空 && semaphore.tryAcquire() → dispatch(next)
+├── evict(groupKey)                        // 移除单组缓存
+└── clear()                               // 移除所有缓存（shutdown 时调用）
+
+GroupState（内部类）
+├── semaphore: Semaphore(maxConcurrency, fair=true)
+├── queue: LinkedBlockingQueue<PendingTask<?>>(queueCapacity)
+└── queueCapacity: int                    // 0 表示不允许排队
 ```
 
-许可数由 `policy.resolveMaxInFlight(groupKey)` 决定，同样遵循"首次解析固定"策略。
+**"首次解析固定"策略**：groupKey 的 `GroupState` 一旦创建，`maxConcurrency` 和 `queueCapacity` 不再改变。
 
-#### GroupQueueManager
+#### 已删除的内部类
 
-管理 per-group 队列阈值 Semaphore 的惰性创建与缓存。供 Layer 2 和 Layer 3 的队列阈值检查共用。
+| 类 | 原职责 | 替代方案 |
+|---|---|---|
+| `GroupExecutorManager` | 管理 per-group VirtualThread ExecutorService | 删除，由 `GroupStateManager.dispatch()` 直接创建虚拟线程 |
+| `GroupSemaphoreManager` | Layer 3: per-group 并发 Semaphore | 合并入 `GroupState.semaphore` |
+| `GroupBulkheadManager` | Layer 2: per-group 在途 Semaphore | 删除，in-flight 由 Semaphore 许可数 + 队列容量隐式控制 |
+| `GroupQueueManager` | 队列阈值 Semaphore | 删除，由 `LinkedBlockingQueue` 容量直接控制 |
 
-```
-GroupQueueManager
-├── queueSemaphoreFor(groupKey) → Semaphore   // computeIfAbsent，fair=true
-├── clear()
-└── evict(groupKey)
-```
-
-许可数由 `policy.resolveQueueThreshold(groupKey)` 决定。
-`GroupExecutor` 仅在配置了 per-group 队列阈值时才创建此 Manager（`null` 表示无限制）。
-全局队列阈值 Semaphore（`globalQueueSemaphore`）直接在 `GroupExecutor` 中管理，仅在 `globalQueueThreshold < Integer.MAX_VALUE` 时创建。
-
-#### GroupExecutorManager
-
-管理 per-group 虚拟线程执行器的生命周期。
-
-```
-GroupExecutorManager                       [implements AutoCloseable]
-├── executorFor(groupKey) → ExecutorService   // computeIfAbsent，newVirtualThreadPerTaskExecutor
-├── shutdownGroup(groupKey)                   // compute() 原子操作：shutdownNow + remove
-├── evict(groupKey)                           // 同 shutdownGroup
-├── awaitTermination(Duration) → boolean      // 优雅关闭：shutdown() → 等待 → shutdownNow()
-└── close()                                   // 立即关闭：shutdownNow() + clear()
-```
-
-**`shutdownGroup()` 原子性**：使用 `ConcurrentHashMap.compute()` 确保 shutdownNow 与 remove 的原子性，防止竞态条件。
-
-**`awaitTermination()` 调用约定**：调用方必须先设置 "closed" 标志，防止并发的 `executorFor()` 在等待期间插入新执行器。
+---
 
 ## 6. 核心执行流程
 
@@ -355,68 +380,81 @@ GroupExecutorManager                       [implements AutoCloseable]
     ├── 1. ensureOpen()  ← AtomicBoolean 检查
     ├── 2. 参数非空校验
     ├── 3. fireOnSubmitted(groupKey, taskId)
-    ├── 4. 读锁（per-group）
-    │      └── executorManager.executorFor(groupKey)
-    ├── 5. groupExecutor.submit(() -> executeWithIsolation(...))
-    │      → 返回 TaskHandle(groupKey, taskId, future)
     │
-    └── ⚠ RejectedExecutionException（执行器已关闭）
-           → fireOnRejected(groupKey, taskId, "executor shut down")
-           → 返回 TaskHandle 包装 CompletableFuture.completedFuture(GroupResult.rejected(...))
-
-虚拟线程内部 executeWithIsolation(groupKey, taskId, callable):
+    ├── 4. [Layer 1] globalMaxInFlight 已配置？
+    │      → tryAcquire(globalInFlightSemaphore)
+    │          失败 → fireOnRejected → handleRejection → 返回 REJECTED TaskHandle
+    │          成功 → 继续（任务生命周期内持有此许可）
     │
-    ├── 0. 读锁（per-group）查找 bulkhead / semaphore / perGroupQueue 引用
+    ├── 5. 读锁（per-group）获取 GroupState
     │
-    ├── 1. Layer 1 全局在途 Semaphore
-    │      tryAcquire() 成功 → 继续
-    │      失败 → globalQueueSemaphore != null ?
-    │               tryAcquire 失败 → 拒绝（释放已持有 permits → handleRejection）
-    │               tryAcquire 成功 → globalInFlightSemaphore.acquire()（阻塞）
-    │                                → 释放 globalQueueSemaphore
+    ├── 6. state.semaphore.tryAcquire()？
+    │      成功 → dispatch(state, task, future)  ← 立即创建虚拟线程
+    │      失败 →
+    │          state.queue.offer(pendingTask)？
+    │              成功 → tryDispatch(state, globalSemaphore, listener)  ← 竞态兜底
+    │              失败（队列满）→ 释放 Layer 1 许可（如有）
+    │                           → fireOnRejected → handleRejection → 返回 REJECTED TaskHandle
     │
-    ├── 2. Layer 2 per-group 在途 Semaphore（bulkhead）
-    │      tryAcquire() 成功 → 继续
-    │      失败 → perGroupQueue != null ?
-    │               tryAcquire 失败 → 拒绝（释放 global → handleRejection）
-    │               tryAcquire 成功 → bulkhead.acquire()（阻塞）
-    │                                → 【持续持有 perGroupQueue 许可，不释放】
-    │                                  （防止 Layer 3 等待期间被其他任务抢占队列槽）
-    │
-    ├── 3. Layer 3 per-group 并发 Semaphore
-    │      tryAcquire() 成功 → 释放 perGroupQueue（若从 Layer 2 持有）→ 继续
-    │      失败 → 已从 Layer 2 持有 perGroupQueue？
-    │               是 → 复用现有队列槽（不重新申请）→ semaphore.acquire()（阻塞）→ 释放 perGroupQueue
-    │               否 → perGroupQueue != null ?
-    │                      tryAcquire 失败 → 拒绝（释放 bulkhead + global → handleRejection）
-    │                      tryAcquire 成功 → semaphore.acquire()（阻塞）→ 释放 perGroupQueue
-    │
-    ├── 4. startNanos = System.nanoTime()  ← 仅在三层 permits 全部获取后捕获
-    ├── 5. fireOnStarted(groupKey, taskId)
-    │
-    ├── 6. executeTask(groupKey, taskId, callable, startNanos)
-    │      ├── callable.call() 成功    → GroupResult.success(...)
-    │      ├── InterruptedException   → 恢复中断 + GroupResult.cancelled(...)
-    │      ├── CancellationException  → GroupResult.cancelled(...)
-    │      └── 其他 Exception         → GroupResult.failed(...)
-    │
-    ├── 7. fireOnCompleted(groupKey, taskId, result)
-    │
-    └── finally（逆序释放，仅释放已成功获取的许可）
-           semaphore.release() if semaphoreAcquired
-           perGroupQueue.release() if perGroupQueueAcquired   ← 中断发生在 Layer 3 acquire 期间时仍可能持有
-           bulkhead.release() if bulkheadAcquired
-           globalInFlightSemaphore.release() if globalAcquired
-           globalQueueSemaphore.release() if globalQueueAcquired
+    └── 7. 返回 TaskHandle(groupKey, taskId, completableFuture)
 ```
 
-### 6.2 批量执行（executeAll）
+### 6.2 虚拟线程内执行（dispatch）
+
+```
+dispatch(state, task, listener):
+    Thread.ofVirtual().start(() -> {
+        │
+        ├── 1. future.isCancelled()？→ 跳过执行，直接 onTaskDone()
+        ├── 2. fireOnStarted(groupKey, taskId)
+        ├── 3. startNanos = System.nanoTime()
+        │
+        ├── 4. 执行任务
+        │      callable.call() 成功    → GroupResult.success(...)
+        │      InterruptedException   → 恢复中断 + GroupResult.cancelled(...)
+        │      CancellationException  → GroupResult.cancelled(...)
+        │      其他 Exception         → GroupResult.failed(...)
+        │
+        ├── 5. fireOnCompleted(groupKey, taskId, result)
+        ├── 6. future.complete(result)
+        │
+        └── 7. finally: onTaskDone(state, globalSemaphore, listener)
+    })
+```
+
+### 6.3 任务完成后调度（onTaskDone + tryDispatch）
+
+```
+onTaskDone(state, globalSemaphore, listener):
+    if globalSemaphore != null:
+        globalSemaphore.release()          ← 无条件释放完成任务的全局许可
+    next = state.queue.poll()
+    if next != null:
+        dispatch(state, next, listener)    ← 移交：per-group 并发许可不 release/acquire，直接复用
+                                           ← next 仍持有它自己入队时获得的全局许可
+    else:
+        state.semaphore.release()          ← 释放并发许可
+        tryDispatch(state, listener)       ← 处理竞态
+
+tryDispatch(state, listener):
+    if state.queue.isEmpty() → return
+    if !state.semaphore.tryAcquire() → return
+    next = state.queue.poll()
+    if next == null:
+        state.semaphore.release()          ← 队列为空（被其他线程抢先），归还许可
+        return
+    dispatch(state, next, listener)
+```
+
+**竞态正确性**：`tryDispatch()` 在 `submit()` 入队后和 `semaphore.release()` 后各调用一次，确保任何时刻"队列非空 + 许可可用"时，都有线程负责调度。
+
+### 6.4 批量执行（executeAll）
 
 ```
 调用方 → executeAll(List<GroupTask<T>>)
     │
     ├── 1. 遍历所有任务，逐一 submit() → 收集 TaskHandle 列表
-    │       （所有任务立即投递到虚拟线程，不等待）
+    │       （所有任务立即投递，不等待）
     │
     ├── 2. 遍历 TaskHandle 列表，逐一 await() → 收集 GroupResult
     │       ├── RejectedTaskException → GroupResult.rejected(groupKey, taskId)
@@ -431,12 +469,10 @@ GroupExecutorManager                       [implements AutoCloseable]
 
 **不 fail-fast**：某个任务失败或被拒绝，不影响其余任务的执行与收集。
 
-### 6.3 拒绝处理（handleRejection）
+### 6.5 拒绝处理（handleRejection）
 
 ```
-handleRejection(groupKey, taskId, task, reason)
-    │
-    ├── fireOnRejected(groupKey, taskId, reason)
+handleRejection(groupKey, taskId, task)
     │
     ├── rejectionHandler != null ?
     │      → handler.onRejected(groupKey, taskId, task)   ← 优先
@@ -444,63 +480,102 @@ handleRejection(groupKey, taskId, task, reason)
     └── rejectionPolicy:
            ABORT        → throw new RejectedTaskException(groupKey, taskId)
            DISCARD      → GroupResult.rejected(groupKey, taskId)
-           CALLER_RUNS  → executeTask(...)  ← 在当前虚拟线程执行，不持有任何 permits
+           CALLER_RUNS  → 在调用 submit() 的当前线程中直接执行任务，不持有任何 permits
 ```
 
-### 6.4 并发控制示意
+### 6.6 并发控制示意
 
 ```
 时间 →
 
-Group "vip" (Layer 3 permits=4, Layer 2 permits=8):
+Group "vip" (maxConcurrency=4, queueCapacity=8):
   Task-1: ████████
   Task-2: ████████
   Task-3: ████████
   Task-4: ████████
-  Task-5:         ████████   ← Layer 3 等待，最多 queueThreshold 个任务可排队
-  Task-6:         ████████
+  Task-5: [队列]  ████████   ← 以 PendingTask 对象等待，无虚拟线程创建
+  Task-6: [队列]          ████████
+  Task-9: REJECTED         ← 4 个运行 + 8 个排队 = 12 个 in-flight，第 13 个拒绝
 
-Group "std" (Layer 3 permits=1, Layer 2 permits=2):
+Group "std" (maxConcurrency=1, queueCapacity=∞):
   Task-A: ████████████████
-  Task-B:                 ████████████████   ← 串行执行
-  Task-C:                                 ████████████████
+  Task-B: [队列]          ████████████████   ← 排队，无线程创建
+  Task-C: [队列]                          ████████████████
 
 ↑ 两个 Group 之间完全并行，互不影响
 ↑ Layer 1 的 globalMaxInFlight 在两个 Group 之间共享配额
 ```
+
+---
 
 ## 7. 线程安全分析
 
 | 共享状态 | 保护机制 | 说明 |
 |---------|---------|------|
 | `GroupExecutor.closed` | `AtomicBoolean` | shutdown 幂等，submit 时检查 |
-| `GroupExecutor.groupLocks` | `ConcurrentHashMap` 自身 + per-key `ReentrantReadWriteLock` | `evictGroup` 持写锁，`submit` / `executeWithIsolation` 持读锁，防止混用新旧资源；`evictGroup` 完成后移除条目，后续操作通过 `computeIfAbsent` 惰性重建 |
-| `GroupSemaphoreManager.semaphoreByGroup` | `ConcurrentHashMap.computeIfAbsent` | 惰性创建，每个 key 只创建一次 |
-| `GroupBulkheadManager.bulkheadByGroup` | `ConcurrentHashMap.computeIfAbsent` | 同上 |
-| `GroupQueueManager.queueByGroup` | `ConcurrentHashMap.computeIfAbsent` | 同上 |
-| `GroupExecutorManager.executorByGroup` | `ConcurrentHashMap.computeIfAbsent` / `compute` | 惰性创建；`shutdownGroup` 使用 `compute()` 保证原子性 |
-| 各层 `Semaphore` | Semaphore 自身线程安全，`fair=true` | acquire/release 原子操作，公平排队防饥饿 |
+| `GroupExecutor.groupLocks` | `ConcurrentHashMap` 自身 + per-key `ReentrantReadWriteLock` | `evictGroup` 持写锁，`submit` 持读锁，防止混用新旧资源 |
+| `GroupStateManager.stateByGroup` | `ConcurrentHashMap.computeIfAbsent` | 惰性创建，每个 key 只创建一次 |
+| `GroupState.semaphore` | Semaphore 自身线程安全，`fair=true` | acquire/tryAcquire/release 原子操作，公平排队防饥饿 |
+| `GroupState.queue` | `LinkedBlockingQueue` 自身线程安全 | offer/poll 原子操作，`size()` 仅用于近似判断（不依赖其精确性） |
 | `GroupPolicy` 全部字段 | 不可变（构建后只读） | Map 存为 `unmodifiableMap`，Builder 做防御性拷贝 |
 | `GroupTask` / `GroupResult` | Java record（天然不可变） | 天然线程安全 |
+| Layer 1 全局 Semaphore | Semaphore 自身线程安全 | 同 per-group Semaphore |
+
+**`tryDispatch()` 的线程安全**：多个线程可能并发调用 `tryDispatch()`，通过 `semaphore.tryAcquire()` 的原子性保证最多一个线程取得许可并调度。队列的 `poll()` 是原子的，获取许可后 `poll()` 返回 null 表示竞争失败，此时立即归还许可并退出。
+
+---
 
 ## 8. 中断与取消语义
 
 | 中断/取消发生点 | 处理方式 |
 |---------------|---------|
-| Layer 1/2/3 `acquire()` 期间 | 捕获 `InterruptedException` → 恢复中断标记 → 返回 `CANCELLED` → finally 仅释放已获取的 permits |
-| `task.call()` 内部 | 捕获 `InterruptedException` → 恢复中断标记 → 返回 `CANCELLED` |
-| `task.call()` 抛 `CancellationException` | 返回 `CANCELLED` |
-| 队列阈值触发拒绝 | 先释放所有已持有 permits → 调用 `handleRejection` → 按策略处理 |
-| `TaskHandle.cancel(true)` | 委托 `Future.cancel(true)` → 中断底层虚拟线程 → 触发上述路径 |
+| `task.call()` 内部 | 捕获 `InterruptedException` → 恢复中断标记 → `future.complete(CANCELLED)` → `onTaskDone()` 正常执行（移交或释放许可） |
+| `task.call()` 抛 `CancellationException` | `future.complete(CANCELLED)` → `onTaskDone()` 正常执行 |
+| 队列满触发拒绝 | 释放 Layer 1 已持有许可 → 调用 `handleRejection` → 按策略处理 |
+| `TaskHandle.cancel(true)` | 委托 `CompletableFuture.cancel(true)` → 将 future 标记为 cancelled；**注意**：`CompletableFuture.cancel()` 不中断底层虚拟线程，正在执行的任务会继续运行直到自行结束，随后 `onTaskDone()` 正常释放许可 |
 | `await(timeout, unit)` 超时 | 捕获 `TimeoutException` → 返回 `CANCELLED`（error=TimeoutException），不取消底层任务 |
+| 任务在队列中等待时被 cancel | `CompletableFuture.cancel()` 标记 future；任务被调度执行时检查 future 是否已取消，若取消则跳过执行直接调用 `onTaskDone()` |
 | `executeAll` 调用线程被中断 | 当前 `await()` 抛 `InterruptedException` → 恢复中断 → 当前及剩余任务均标记 `CANCELLED` |
 
-## 9. 包结构
+---
+
+## 9. 兼容性与行为变化
+
+### 9.1 CALLER_RUNS 语义变化（Breaking）
+
+| | 旧设计 | 新设计 |
+|---|---|---|
+| 执行线程 | `executeWithIsolation` 所在的组虚拟线程 | 调用 `submit()` 的线程（标准 CALLER_RUNS 语义） |
+| 原因 | 拒绝发生在虚拟线程内部（信号量阻塞后触发） | 拒绝发生在 `submit()` 调用路径上（队列满时同步拒绝） |
+| 影响 | 依赖"CALLER_RUNS 在特定线程执行"的代码需适配 | 更符合 `ThreadPoolExecutor.CallerRunsPolicy` 的直觉语义 |
+
+### 9.2 参数 API 变化（Breaking）
+
+| 参数 | 变化 |
+|---|---|
+| `defaultMaxInFlightPerGroup` | **移除**（Builder 方法删除） |
+| `perGroupMaxInFlight` | **移除**（Builder 方法删除） |
+| `queueThreshold`（`defaultQueueThresholdPerGroup`、`perGroupQueueThreshold`） | 语义从"阻塞前的最大等待数（Semaphore 许可）"变为"`LinkedBlockingQueue` 容量"；数值含义一致，无需迁移 |
+
+### 9.3 行为变化（非 Breaking）
+
+| 行为 | 旧设计 | 新设计 |
+|---|---|---|
+| 提交时虚拟线程创建 | 每次 submit() 立即创建 | 仅在获得调度许可时创建 |
+| 排队任务存储 | 虚拟线程对象（阻塞在信号量） | `PendingTask` 对象（LinkedBlockingQueue） |
+| 三层 Semaphore | Layer 1 + Layer 2（bulkhead）+ Layer 3（concurrency） | Layer 1（全局）+ Per-Group（Semaphore + 显式队列） |
+| `TaskHandle` 内部 Future | `Future<GroupResult<T>>` | `CompletableFuture<GroupResult<T>>` |
+| `toCompletableFuture()` | 需额外虚拟线程桥接 | 直接返回内部 CompletableFuture，无额外线程 |
+| `shutdownGroup()` | 关停执行器（已提交但排队的虚拟线程继续运行） | 关停后清空队列，运行中任务继续完成 |
+
+---
+
+## 10. 包结构
 
 ```
 io.github.kobe
-├── GroupExecutor.java             // 核心执行器（入口，三层防护 + per-group 虚拟线程）
-├── GroupPolicy.java               // 并发策略 + 隔离策略 + 拒绝策略（Builder，构建时验证）
+├── GroupExecutor.java             // 核心执行器（入口，两层保护 + 调度）
+├── GroupPolicy.java               // 并发策略 + 拒绝策略（Builder，构建时验证）
 ├── GroupTask.java                 // 任务定义（record，三字段非空）
 ├── GroupResult.java               // 执行结果（record，含 REJECTED 状态，durationNanos）
 ├── TaskHandle.java                // 提交句柄（await/join/超时/CompletableFuture）
@@ -508,47 +583,104 @@ io.github.kobe
 ├── TaskLifecycleListener.java     // 任务生命周期监听器接口（default 空实现）
 ├── RejectionPolicy.java           // 内置拒绝策略枚举（ABORT/DISCARD/CALLER_RUNS）
 ├── RejectionHandler.java          // 自定义拒绝处理器（@FunctionalInterface，优先于 RejectionPolicy）
-├── RejectedTaskException.java     // ABORT 策略下抛出的异常（含 groupKey/taskId）
-└── internal/
-    ├── GroupSemaphoreManager.java  // Layer 3: per-group 并发 Semaphore（fair，首次固定）
-    ├── GroupBulkheadManager.java   // Layer 2: per-group 在途 Semaphore（fair，首次固定）
-    ├── GroupExecutorManager.java   // Per-group 虚拟线程执行器（独立生命周期，compute 原子关停）
-    └── GroupQueueManager.java      // Per-group 队列阈值 Semaphore（供 Layer 2/3 共用）
+└── RejectedTaskException.java     // ABORT 策略下抛出的异常（含 groupKey/taskId）
+
+io.github.kobe.internal
+└── GroupStateManager.java         // Per-group 状态管理（Semaphore + Queue + 调度逻辑）
 
 io.github.kobe (test)
-├── GroupExecutorTest.java         // 核心功能测试（并发控制、隔离、生命周期、验证等）
-└── QueueThresholdTest.java        // 队列阈值与拒绝策略测试
+├── GroupExecutorTest.java         // 核心功能测试
+└── QueueThresholdTest.java        // 队列容量与拒绝策略测试
 ```
 
-## 10. 设计约束与权衡
+**删除的内部类**：`GroupSemaphoreManager`、`GroupBulkheadManager`、`GroupExecutorManager`、`GroupQueueManager`
+
+---
+
+## 11. 设计约束与权衡
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
+| 任务创建时机 | 获得许可后才创建虚拟线程 | 避免排队任务以线程形式堆积；PendingTask 对象内存开销远低于虚拟线程对象 |
+| 不池化虚拟线程 | 每次调度创建新虚拟线程 | 避免 ThreadLocal 污染（池化线程复用 Thread 对象，前序任务残留 ThreadLocal 值会泄漏给后续任务） |
 | Semaphore 并发度策略 | 首次解析固定 | 简单稳定，避免运行中动态调整许可数带来的复杂性 |
 | 缓存清理策略 | 不自动 GC，支持手动 `evictGroup()` | 假设 groupKey 规模可控；手动驱逐给调用方完全控制权 |
-| Per-group 执行器 | `newVirtualThreadPerTaskExecutor()`，成本极低 | 实现逻辑故障隔离和独立生命周期（可单独关停），不预分配线程 |
+| 移交（hand-off）模式 | 任务完成后直接传递许可给队列中的下一个任务 | 避免 release + tryAcquire 往返，减少竞态窗口，提升吞吐 |
+| tryDispatch() 兜底 | 在 queue.offer() 后和 semaphore.release() 后各调用一次 | 消除两处竞态窗口，确保任何"队列非空 + 许可可用"状态都有调度触发 |
 | resolver 异常处理 | 静默降级到默认值 | 单个 resolver 异常不影响整个执行批次 |
 | 非法配置值 | Builder `build()` 抛 `IllegalArgumentException` | 尽早暴露配置错误；动态 resolver 返回值通过 `sanitize()` 兜底纠正为 ≥1 |
-| fail-fast 策略 | `executeAll` 不 fail-fast | 收集全部结果，调用方可自行决定如何处理失败；仅调用线程中断时才取消剩余 |
-| evictGroup 一致性 | per-group `ReentrantReadWriteLock` | 写锁保护 evict，读锁保护资源查找，防止新旧资源混用导致 permit 泄漏 |
-| CALLER_RUNS 线程语义 | 在组执行器的虚拟线程中执行，不持有任何 permits | 不阻塞其他任务，任务降级处理时不占用隔离资源 |
-| 全局/per-group 队列阈值 | 仅在显式配置时创建对应 Semaphore（null 跳过） | 避免对未启用此功能的场景产生任何额外开销 |
-| fair Semaphore 性能 | 轻微额外开销 | 相比非公平模式多一次 FIFO 队列操作；在虚拟线程场景下可忽略，公平性收益更重要 |
+| fail-fast 策略 | `executeAll` 不 fail-fast | 收集全部结果，调用方可自行决定如何处理失败 |
+| CALLER_RUNS 语义 | 在调用 submit() 的线程执行 | 标准语义（同 ThreadPoolExecutor.CallerRunsPolicy），不依赖虚拟线程实现细节 |
+| fair Semaphore 性能 | 轻微额外开销 | 相比非公平模式多一次 FIFO 队列操作；公平性收益更重要 |
 
-## 11. 变更日志
+---
+
+## 12. 测试方案
+
+### 12.1 关键场景
+
+| 场景 | 验证点 |
+|---|---|
+| 基本并发控制 | maxConcurrency=2，提交 10 个慢任务：同一时刻不超过 2 个并发执行 |
+| 队列排队 | maxConcurrency=2，queueCapacity=3，提交 8 个任务：2 运行 + 3 排队 + 3 拒绝 |
+| 自动调度 | 运行中任务完成后，队列中的任务自动被调度执行，无需外部触发 |
+| 竞态稳定性 | 多线程并发 submit + concurrent complete，验证无任务永久滞留队列 |
+| Layer 1 全局限制 | globalMaxInFlight=5，两组各提交 10 个任务：全局同时执行不超过 5 个 |
+| 优雅关闭 | shutdown(timeout)：排队中任务被丢弃（REJECTED），运行中任务等待完成 |
+| evictGroup | 驱逐后重新提交任务，新的 GroupState 被创建，旧任务不受影响 |
+| shutdownGroup | 关停单组不影响其他组 |
+| CALLER_RUNS | 队列满时触发，任务在 submit() 调用线程执行，验证线程标识 |
+| 生命周期监听器 | 四个回调（submitted/started/completed/rejected）在正确节点触发 |
+| 取消排队中的任务 | cancel() 排队任务，最终获得 CANCELLED 结果，许可正确释放 |
+| 高并发压力 | 1000+ 任务，50+ 分组，并发提交，验证无死锁/无任务丢失/无许可泄漏 |
+
+### 12.2 兼容性测试
+
+- 原 `testMaxConcurrencyPerGroup` 等并发控制测试：行为不变，正常通过
+- 原 `testCallerRunsDoesNotHoldPermits`：改为验证 CALLER_RUNS 在 submit() 调用线程执行
+
+---
+
+## 13. 风险点
+
+| 风险 | 描述 | 缓解措施 |
+|------|------|---------|
+| tryDispatch() 竞态 | 多线程并发 submit/complete 时，可能出现任务滞留队列 | tryDispatch() 在入队后和 release 后各调用一次；通过高并发压力测试验证 |
+| 队列任务取消 | CompletableFuture.cancel() 后任务仍可能被调度到执行 | 调度前检查 future.isCancelled()，跳过执行直接 onTaskDone() |
+| Layer 1 与 per-group 的双重控制 | 全局许可被占用但 per-group 队列满，导致全局许可泄漏 | 入队失败时必须释放已持有的 Layer 1 许可；finally 块兜底 |
+| evictGroup 期间的调度 | evict 后 GroupState 被移除，但 dispatch 仍持有旧 state 引用 | dispatch 使用局部变量引用 state，evict 只影响新提交；旧任务完成后调用 onTaskDone()，从 stateByGroup 中查找当前（可能是新建的）state |
+| shutdown 时的队列任务 | 已入队但未执行的任务可能被忽略 | shutdown() 清空队列前对每个队列任务触发 complete(REJECTED) |
+| groupKey 规模膨胀 | 大量瞬态 groupKey 导致 stateByGroup 和 groupLocks 无限增长 | 使用 evictGroup() 清理；文档建议控制 groupKey 规模或按需驱逐 |
+
+---
+
+## 14. 变更日志
+
+### 2026-03-12 — 架构演进：显式队列 + Semaphore 调度
+
+| 变更 | 严重性 | 涉及文件 | 说明 |
+|------|--------|---------|------|
+| 移除三层 Semaphore，改为显式队列调度 | 架构 | 全部 internal 类、GroupExecutor | 废弃 Layer 2（bulkhead）和 Layer 3（concurrency semaphore）的信号量阻塞模式，改为 `Semaphore` + `LinkedBlockingQueue` 的显式调度：tryAcquire 成功立即创建虚拟线程，失败则入队 |
+| 新增 GroupStateManager | 架构 | 新增 `internal/GroupStateManager.java` | 统一管理 per-group Semaphore + LinkedBlockingQueue + 调度逻辑（dispatch / onTaskDone / tryDispatch） |
+| 删除 GroupExecutorManager | 架构 | 删除 `internal/GroupExecutorManager.java` | 不再使用 per-group ExecutorService；虚拟线程通过 `Thread.ofVirtual().start()` 按需创建 |
+| 删除 GroupSemaphoreManager / GroupBulkheadManager / GroupQueueManager | 架构 | 删除三个文件 | 职责分别由 GroupState.semaphore、LinkedBlockingQueue 容量、GroupStateManager 调度逻辑承担 |
+| CALLER_RUNS 执行线程变更 | Breaking | `GroupExecutor.java`, `RejectionPolicy.java` | 从组虚拟线程（executeWithIsolation 线程）改为调用 submit() 的线程，符合标准 CALLER_RUNS 语义 |
+| 移除 maxInFlight 相关 API | Breaking | `GroupPolicy.java` | 删除 `defaultMaxInFlightPerGroup`、`perGroupMaxInFlight`、`resolveMaxInFlight()` |
+| queueThreshold 语义变更 | 非 Breaking | `GroupPolicy.java` | 从"阻塞前最大等待数（Semaphore 许可）"改为"LinkedBlockingQueue 容量"；数值含义一致 |
+| TaskHandle 内部 Future 类型变更 | 非 Breaking | `TaskHandle.java` | 从 `Future<GroupResult<T>>` 改为 `CompletableFuture<GroupResult<T>>`；`toCompletableFuture()` 不再需要额外桥接线程 |
 
 ### 2026-03-07 — per-group 队列许可跨层持有 & 拒绝前显式释放许可
 
 | 变更 | 严重性 | 涉及文件 | 说明 |
 |------|--------|---------|------|
-| per-group 队列许可跨层持有 | 严重 | `GroupExecutor.java` | Layer 2（bulkhead）阻塞等待成功后不立即释放 per-group 队列许可，而是持续持有至 Layer 3（concurrency）获取完成。若提前释放，另一任务可能抢占队列槽，导致已持有 bulkhead permit 的任务在 Layer 3 被拒绝，违反单调进展保证。Layer 3 tryAcquire 成功时释放持有的槽；Layer 3 需要阻塞时，复用现有槽（不重新申请）直至 acquire 成功后释放 |
-| 拒绝前显式释放已持有的 permits | 严重 | `GroupExecutor.java` | 队列阈值触发拒绝时，在调用 `handleRejection` 之前显式将已持有的上层 permits 释放并将 acquired 标志置 false，而非仅依赖 finally 块。Layer 2 拒绝时释放 global permit；Layer 3 拒绝时释放 bulkhead + global permits |
+| per-group 队列许可跨层持有 | 严重 | `GroupExecutor.java` | Layer 2（bulkhead）阻塞等待成功后不立即释放 per-group 队列许可，持续持有至 Layer 3（concurrency）获取完成，防止单调进展被破坏 |
+| 拒绝前显式释放已持有的 permits | 严重 | `GroupExecutor.java` | 队列阈值触发拒绝时，在调用 `handleRejection` 之前显式释放已持有的上层 permits |
 
 ### 2026-03-06 — 代码审查修复
 
 | 变更 | 严重性 | 涉及文件 | 说明 |
 |------|--------|---------|------|
-| `submit()` 捕获 `RejectedExecutionException` | 严重 | `GroupExecutor.java` | 底层执行器在 `ensureOpen()` 与 `submit()` 之间被关闭时（通过 `shutdownGroup`、`evictGroup` 或与 `shutdown` 竞态），原来会泄漏原始异常。现在捕获该异常，触发 `onRejected` 回调，返回包含 `REJECTED` 结果的 `TaskHandle` |
-| `evictGroup()` 清理 `groupLocks` 条目 | 中等 | `GroupExecutor.java` | 释放写锁后移除 `groupLocks` 中对应的 `ReentrantReadWriteLock` 条目，防止大量瞬态 groupKey 导致锁 Map 无限增长。后续操作通过 `computeIfAbsent` 惰性重建 |
-| `CALLER_RUNS` Javadoc 修正 | 中等 | `RejectionPolicy.java` | 原文档错误描述为"在调用方的虚拟线程中执行"，实际执行线程是组执行器的虚拟线程（运行 `executeWithIsolation` 的线程），已修正 |
-| Builder 增加 `rejectionPolicy` 空值校验 | 轻微 | `GroupPolicy.java` | `build()` 新增 `rejectionPolicy == null` 检查，抛出 `IllegalArgumentException`。此前若通过 setter 设为 null，会在 `handleRejection` 的 switch 表达式处抛出 `NullPointerException` |
+| `submit()` 捕获 `RejectedExecutionException` | 严重 | `GroupExecutor.java` | 底层执行器在 ensureOpen 与 submit 之间被关闭时，捕获异常并返回 REJECTED TaskHandle |
+| `evictGroup()` 清理 `groupLocks` 条目 | 中等 | `GroupExecutor.java` | 防止大量瞬态 groupKey 导致锁 Map 无限增长 |
+| `CALLER_RUNS` Javadoc 修正 | 中等 | `RejectionPolicy.java` | 修正执行线程描述 |
+| Builder 增加 `rejectionPolicy` 空值校验 | 轻微 | `GroupPolicy.java` | build() 新增 null 检查，抛出 IllegalArgumentException |

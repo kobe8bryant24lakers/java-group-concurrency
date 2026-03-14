@@ -24,31 +24,32 @@ The project has zero runtime dependencies — only JUnit 5 for testing.
 
 ## Architecture
 
-This is a **grouped concurrency control library** (`io.github.kobe:group-concurrency`) built on JDK 21 Virtual Threads. It solves the problem of running tasks in parallel across groups while enforcing per-group concurrency limits with three-layer protection.
+This is a **grouped concurrency control library** (`io.github.kobe:group-concurrency`) built on JDK 21 Virtual Threads. It solves the problem of running tasks in parallel across groups while enforcing per-group concurrency limits with two-layer protection and explicit queue-based scheduling.
 
-### Core Design: Virtual Threads + Three-Layer Protection
+### Core Design: Virtual Threads + Explicit Queue Dispatch
 
-Tasks are partitioned by `groupKey`. Each group gets its own virtual thread executor for fault isolation. Three layers of semaphores control concurrency:
+Tasks are partitioned by `groupKey`. Virtual threads are created **only when a task is actually dispatched** (i.e., obtains a semaphore permit). Tasks that cannot run immediately are stored in an explicit `LinkedBlockingQueue` as lightweight `PendingTask` objects rather than blocking on a semaphore.
 
-1. **Layer 1 — Global In-Flight Semaphore** (fair): caps total tasks across all groups
-2. **Layer 2 — Per-Group Bulkhead Semaphore** (fair): caps in-flight tasks per group
-3. **Layer 3 — Per-Group Concurrency Semaphore** (fair): caps actual concurrency per group
+Two layers of control:
 
-Semaphores are acquired in order (Global → Bulkhead → Concurrency) and released in reverse to prevent deadlocks. Queue threshold checks apply to both Layer 2 and Layer 3 — tasks are rejected before blocking at either layer when thresholds are exceeded. Rejected tasks release all held permits before the rejection handler/policy is invoked.
+1. **Layer 1 — Global In-Flight Semaphore** (optional, fair): caps total in-flight tasks across all groups. Each accepted task holds one global permit from submission until completion. Global permits are released unconditionally in `onTaskDone()`, regardless of hand-off.
+2. **Per-Group — Semaphore + LinkedBlockingQueue**: a fair `Semaphore` controls concurrent execution (= `maxConcurrency`), and a bounded `LinkedBlockingQueue` holds waiting tasks. When a task completes, the per-group concurrency permit is handed off directly to the next queued task (no release/acquire round-trip). `tryDispatch()` closes the race window between submission and completion.
+
+Rejected tasks release all held permits before the rejection handler/policy is invoked.
 
 ### Key Classes (all in `io.github.kobe`)
 
-- **`GroupExecutor`** — Entry point. Factory method `newVirtualThreadExecutor(GroupPolicy)`. Submits individual tasks (`submit()`) or batches (`executeAll()`). Implements `AutoCloseable`. Supports `shutdown(Duration)` for graceful shutdown with timeout, `evictGroup(String)` for cache eviction (also cleans up per-group lock entries), and `shutdownGroup(String)` for per-group shutdown. `submit()` catches `RejectedExecutionException` from shut-down executors and returns a `REJECTED` TaskHandle.
+- **`GroupExecutor`** — Entry point. Factory method `newVirtualThreadExecutor(GroupPolicy)`. Submits individual tasks (`submit()`) or batches (`executeAll()`). Implements `AutoCloseable`. Supports `shutdown(Duration)` for graceful shutdown with timeout, `evictGroup(String)` for cache eviction (also cleans up per-group lock entries), and `shutdownGroup(String)` for per-group shutdown.
 - **`GroupPolicy`** — Builder-configured concurrency policy with:
   - Three-tier concurrency resolution: `perGroupMaxConcurrency` > `concurrencyResolver` > `defaultMaxConcurrencyPerGroup`
-  - Isolation config: `globalMaxInFlight`, `defaultMaxInFlightPerGroup`, `perGroupMaxInFlight`
-  - Queue threshold config: `globalQueueThreshold`, `defaultQueueThresholdPerGroup`, `perGroupQueueThreshold`
+  - Global config: `globalMaxInFlight`
+  - Queue threshold config: `defaultQueueThresholdPerGroup`, `perGroupQueueThreshold`
   - Optional `TaskLifecycleListener` for task event callbacks
-  - Builder validates all parameters on `build()` — throws `IllegalArgumentException` for invalid values (concurrency < 1, inFlight < 1, queueThreshold < 0, rejectionPolicy null)
+  - Builder validates all parameters on `build()` — throws `IllegalArgumentException` for invalid values (concurrency < 1, globalMaxInFlight < 1, queueThreshold < 0, rejectionPolicy null)
   - Builder performs defensive copies of mutable Map arguments
 - **`GroupTask<T>`** — Immutable record: `(groupKey, taskId, Callable<T>)`
 - **`GroupResult<T>`** — Immutable record with status, value/error, and nanosecond timing
-- **`TaskHandle<T>`** — Wraps `Future<GroupResult<T>>` with `await()`, `join()`, `cancel()`, `await(timeout, unit)`, `join(timeout, unit)`, and `toCompletableFuture()`
+- **`TaskHandle<T>`** — Wraps `CompletableFuture<GroupResult<T>>` with `await()`, `join()`, `cancel()`, `await(timeout, unit)`, `join(timeout, unit)`, and `toCompletableFuture()`
 - **`TaskStatus`** — Enum: `SUCCESS`, `FAILED`, `CANCELLED`, `REJECTED`
 - **`TaskLifecycleListener`** — Interface with `onSubmitted`, `onStarted`, `onCompleted`, `onRejected` callbacks. RuntimeExceptions are silently caught.
 - **`RejectionPolicy`** — Enum: `ABORT`, `DISCARD`, `CALLER_RUNS`
@@ -57,18 +58,16 @@ Semaphores are acquired in order (Global → Bulkhead → Concurrency) and relea
 
 ### Internal
 
-- **`internal.GroupSemaphoreManager`** — Layer 3: lazily creates and caches fair `Semaphore` instances per group. Uses "first resolution fixed" strategy. Supports `clear()` and `evict(groupKey)`.
-- **`internal.GroupBulkheadManager`** — Layer 2: lazily creates and caches fair `Semaphore` instances per group for in-flight limiting. Supports `clear()` and `evict(groupKey)`.
-- **`internal.GroupExecutorManager`** — Manages per-group virtual thread executors. Supports `shutdownGroup()` (atomic via `compute()`), `evict()`, `awaitTermination(Duration)`, and `close()` (uses `shutdownNow()`). Callers must set a "closed" flag before `awaitTermination()`.
-- **`internal.GroupQueueManager`** — Manages per-group queue threshold semaphores. Used by Layer 2 and Layer 3 queue threshold checks. Supports `clear()` and `evict(groupKey)`.
+- **`internal.GroupStateManager`** — Manages per-group state (`GroupState` = fair `Semaphore` + `LinkedBlockingQueue`) and dispatch logic (`dispatch`, `onTaskDone`, `tryDispatch`). Uses "first resolution fixed" strategy via `ConcurrentHashMap.computeIfAbsent`. Supports `clear()` and `evict(groupKey)`.
 
 ### Cancellation & Thread Safety
 
-- Interrupts during `acquire()` or task execution restore the interrupt flag and produce a `CANCELLED` result.
+- Interrupts during task execution restore the interrupt flag and produce a `CANCELLED` result.
 - Task submission, semaphore access, and executor state (`AtomicBoolean`) are all thread-safe.
-- `evictGroup()` uses a per-group `ReentrantReadWriteLock` (write lock) for atomicity; `submit()` and `executeWithIsolation()` use read locks for resource lookups. After eviction, the per-group lock entry is removed from `groupLocks` to prevent unbounded growth.
-- `shutdown()` clears all manager caches (executors, semaphores, bulkheads, queues, locks) to allow GC. Running tasks still hold direct semaphore references and release permits on completion.
-- `shutdownGroup()` uses atomic `ConcurrentHashMap.compute()` to prevent race conditions.
-- All semaphores (Layers 1-3) use fair mode to prevent starvation.
-- `CALLER_RUNS` rejection releases all held permits before executing the task directly in the group executor's virtual thread (the thread running `executeWithIsolation`), not in the original thread that called `submit()`.
-- `durationNanos()` on `GroupResult` reflects pure execution time (startTimeNanos captured after all permits acquired).
+- `evictGroup()` uses a per-group `ReentrantReadWriteLock` (write lock) for atomicity; `submit()` uses read locks for resource lookups. After eviction, the per-group lock entry is removed from `groupLocks` to prevent unbounded growth.
+- `shutdown()` clears all manager caches (state, locks) to allow GC. Running tasks still hold direct semaphore references and release permits on completion.
+- All semaphores use fair mode to prevent starvation.
+- `CALLER_RUNS` rejection executes the task directly in the thread that called `submit()`, without holding any permits. This matches standard `ThreadPoolExecutor.CallerRunsPolicy` semantics.
+- `cancel(true)` on `TaskHandle` marks the `CompletableFuture` as cancelled but does **not** interrupt the underlying virtual thread (`CompletableFuture.cancel()` ignores `mayInterruptIfRunning`). Queued tasks are skipped at dispatch time if their future is already cancelled.
+- `onTaskDone()` runs in a `finally` block to guarantee permit release even if an `Error` is thrown.
+- `durationNanos()` on `GroupResult` reflects pure execution time (startTimeNanos captured after permit acquisition, before task execution).
