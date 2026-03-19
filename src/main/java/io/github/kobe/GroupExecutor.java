@@ -6,8 +6,11 @@ import io.github.kobe.internal.GroupStateManager.PendingTask;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -282,6 +285,57 @@ public final class GroupExecutor implements AutoCloseable {
         }
         // Remove the lock entry after releasing so it can be GC'd.
         groupLocks.remove(groupKey);
+    }
+
+    // ---- Metrics / Observability API ----
+
+    /**
+     * Returns a point-in-time snapshot of the given group's operational state,
+     * or {@link Optional#empty()} if the group has no allocated state.
+     *
+     * <p>Safe to call after shutdown (returns empty). Never blocks, never throws.
+     *
+     * @param groupKey the group to query
+     * @return snapshot of group stats, or empty
+     */
+    public Optional<GroupStats> groupStats(String groupKey) {
+        if (closed.get()) {
+            return Optional.empty();
+        }
+        return stateManager.snapshotFor(groupKey);
+    }
+
+    /**
+     * Returns a point-in-time snapshot of executor-wide operational counters.
+     *
+     * <p>Safe to call after shutdown (returns zeroed stats). Never blocks, never throws.
+     *
+     * @return aggregated executor stats
+     */
+    public GroupExecutorStats stats() {
+        if (closed.get()) {
+            return new GroupExecutorStats(0, 0, 0, 0, policy.globalMaxInFlight());
+        }
+        int[] totals = stateManager.aggregateTotals();
+        int globalUsed = globalInFlightSemaphore != null
+                ? policy.globalMaxInFlight() - globalInFlightSemaphore.availablePermits()
+                : 0;
+        return new GroupExecutorStats(totals[0], totals[1], totals[2],
+                globalUsed, policy.globalMaxInFlight());
+    }
+
+    /**
+     * Returns an unmodifiable snapshot of the group keys that currently have allocated state.
+     *
+     * <p>Safe to call after shutdown (returns empty set). Never blocks, never throws.
+     *
+     * @return set of active group keys
+     */
+    public Set<String> activeGroupKeys() {
+        if (closed.get()) {
+            return Collections.emptySet();
+        }
+        return stateManager.activeGroupKeys();
     }
 
     private void ensureOpen() {

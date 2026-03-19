@@ -39,7 +39,7 @@ Rejected tasks release all held permits before the rejection handler/policy is i
 
 ### Key Classes (all in `io.github.kobe`)
 
-- **`GroupExecutor`** — Entry point. Factory method `newVirtualThreadExecutor(GroupPolicy)`. Submits individual tasks (`submit()`) or batches (`executeAll()`). Implements `AutoCloseable`. Supports `shutdown(Duration)` for graceful shutdown with timeout, `evictGroup(String)` for cache eviction (also cleans up per-group lock entries), and `shutdownGroup(String)` for per-group shutdown.
+- **`GroupExecutor`** — Entry point. Factory method `newVirtualThreadExecutor(GroupPolicy)`. Submits individual tasks (`submit()`) or batches (`executeAll()`). Implements `AutoCloseable`. Supports `shutdown(Duration)` for graceful shutdown with timeout, `evictGroup(String)` for cache eviction (also cleans up per-group lock entries), `shutdownGroup(String)` for per-group shutdown, and observability via `stats()`, `groupStats(String)`, and `activeGroupKeys()`.
 - **`GroupPolicy`** — Builder-configured concurrency policy with:
   - Three-tier concurrency resolution: `perGroupMaxConcurrency` > `concurrencyResolver` > `defaultMaxConcurrencyPerGroup`
   - Global config: `globalMaxInFlight`
@@ -54,6 +54,8 @@ Rejected tasks release all held permits before the rejection handler/policy is i
 - **`TaskLifecycleListener`** — Interface with `onSubmitted`, `onStarted`, `onCompleted`, `onRejected` callbacks. RuntimeExceptions are silently caught.
 - **`RejectionPolicy`** — Enum: `ABORT`, `DISCARD`, `CALLER_RUNS`
 - **`RejectionHandler`** — Custom rejection handler interface (overrides `RejectionPolicy` when both are set)
+- **`GroupStats`** — Immutable record: point-in-time snapshot of a single group's state (activeCount, queuedCount, maxConcurrency, queueCapacity)
+- **`GroupExecutorStats`** — Immutable record: executor-wide aggregated counters (activeGroupCount, totalActiveCount, totalQueuedCount, globalInFlightUsed, globalInFlightMax)
 - **`RejectedTaskException`** — Thrown when `ABORT` policy rejects a task
 
 ### Internal
