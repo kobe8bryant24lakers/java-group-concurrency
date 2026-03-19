@@ -2,9 +2,9 @@
 
 A lightweight Java library for **grouped concurrency control** built on JDK 21 Virtual Threads.
 
-Tasks are partitioned by `groupKey` and groups run in parallel, while three layers of fair semaphores enforce concurrency limits at the global, per-group in-flight, and per-group execution levels.
+Tasks are partitioned by `groupKey` and groups run in parallel, while per-group concurrency limits and an optional global in-flight cap enforce isolation. Virtual threads are created **only when a task is dispatched** — waiting tasks are stored as lightweight objects in an explicit queue, not as blocked threads.
 
-**Zero runtime dependencies** -- only JDK 21; JUnit 5 is test-scoped.
+**Zero runtime dependencies** — only JDK 21; JUnit 5 is test-scoped.
 
 ---
 
@@ -46,65 +46,68 @@ try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
 
 ---
 
-## Three-Layer Protection Model
+## Architecture: Explicit Queue Dispatch
 
-Semaphores are acquired in order (1 -> 2 -> 3) and released in reverse to prevent deadlocks. All semaphores use **fair mode** to prevent starvation.
+The core design avoids blocking virtual threads on semaphore waits. Instead, tasks that cannot run immediately are stored in a bounded `LinkedBlockingQueue` as lightweight `PendingTask` objects. A virtual thread is created only when a task obtains a concurrency permit and is actually dispatched.
 
 ```
               submit("groupA", "t1", task)
                         |
                         v
         +-------------------------------+
-        | Global Queue Threshold Check  |  tryAcquire() -- reject if full
-        +-------------------------------+
-                        |
-                        v
-        +-------------------------------+
-        | Layer 1: Global In-Flight     |
+        | Layer 1: Global In-Flight     |  tryAcquire() — reject if full
+        | (optional)                    |
         | caps total tasks across ALL   |
         | groups (globalMaxInFlight)    |
         +-------------------------------+
-                  | acquire() done → release global queue permit
-                  v
-        +-------------------------------+
-        | Per-Group Queue Threshold     |  tryAcquire() -- reject if full
-        +-------------------------------+
                         |
                         v
         +-------------------------------+
-        | Layer 2: Per-Group Bulkhead   |
-        | caps queued + running tasks   |
-        | per group (maxInFlightPerGrp) |
+        | Per-Group Concurrency         |  tryAcquire() the fair Semaphore
+        | Semaphore (maxConcurrency)    |
         +-------------------------------+
-                  | acquire() done → release per-group queue permit
-                  v
-        +-------------------------------+
-        | Per-Group Queue Threshold     |  tryAcquire() -- reject if full
-        +-------------------------------+
-                        |
-                        v
-        +-------------------------------+
-        | Layer 3: Per-Group Concurrency|
-        | caps actual concurrent        |
-        | execution per group           |
-        +-------------------------------+
-                  | acquire() done → release per-group queue permit
-                  v
-                 Task executes on
-              per-group virtual thread
+              /                   \
+        permit acquired         no permit
+             |                      |
+             v                      v
+     +----------------+    +---------------------+
+     | Dispatch:      |    | Queue (bounded):    |
+     | create virtual |    | offer() to          |
+     | thread & run   |    | LinkedBlockingQueue |
+     +----------------+    +---------------------+
+             |                      |
+             |               queue full?
+             |              /          \
+             |          no (queued)   yes → reject
+             |              |
+             |              v
+             |      tryDispatch() closes
+             |      the race window
+             |
+             v
+        Task completes
+             |
+             v
+     +---------------------------+
+     | onTaskDone():             |
+     | poll queue → hand off     |
+     | permit to next task       |
+     | (no release/acquire       |
+     |  round-trip)              |
+     | OR release permit +       |
+     | tryDispatch()             |
+     +---------------------------+
 ```
 
-> Queue threshold checks use an optimistic strategy: each protection-layer semaphore is tried non-blocking first (`tryAcquire()`). Only when the permit is not immediately available does the queue threshold check kick in. This applies to both Layer 2 (bulkhead) and Layer 3 (concurrency), preventing tasks from piling up at either layer. A threshold of 0 correctly allows tasks that don't need to wait.
+**Hand-off dispatch:** When a task completes, the per-group concurrency permit is transferred directly to the next queued task — no release/acquire round-trip. `tryDispatch()` closes the race window between submission and completion.
 
-> When a task is rejected, all previously acquired permits (global in-flight, bulkhead) are released **before** the rejection handler or policy is invoked. This means `CALLER_RUNS` tasks execute without holding any isolation permits.
+**Global permits** are released unconditionally in `onTaskDone()`, regardless of hand-off. Each task independently holds its own global permit from submission until completion.
 
 | Component | Scope | Default | Purpose |
 |-----------|-------|---------|---------|
-| Global Queue | Global | `Integer.MAX_VALUE` (off) | Limit tasks waiting for Layer 1 |
-| Layer 1 | Global | `Integer.MAX_VALUE` | Prevent system-wide overload |
-| Per-Group Queue | Per-group | `Integer.MAX_VALUE` (off) | Limit tasks waiting for Layer 2 and Layer 3 |
-| Layer 2 | Per-group | `Integer.MAX_VALUE` | Limit queued + running tasks per group |
-| Layer 3 | Per-group | `1` | Limit actual concurrency per group |
+| Layer 1: Global In-Flight | Global | `Integer.MAX_VALUE` (off) | Cap total tasks across all groups |
+| Per-Group Concurrency | Per-group | `1` | Limit actual concurrent execution per group |
+| Per-Group Queue | Per-group | `Integer.MAX_VALUE` (unbounded) | Buffer tasks waiting for a concurrency permit |
 
 ---
 
@@ -116,18 +119,15 @@ Configure concurrency limits via the builder:
 
 ```java
 GroupPolicy policy = GroupPolicy.builder()
-    // --- Layer 3: Per-group concurrency (resolution priority: high -> low) ---
+    // --- Per-group concurrency (resolution priority: high -> low) ---
     .perGroupMaxConcurrency(Map.of("groupA", 2, "groupB", 5))  // 1st: explicit overrides
     .concurrencyResolver(key -> key.startsWith("vip:") ? 4 : 1) // 2nd: dynamic resolver
     .defaultMaxConcurrencyPerGroup(1)                            // 3rd: fallback (default: 1)
 
-    // --- Layer 1 & 2: In-flight limits ---
-    .globalMaxInFlight(100)                                      // Layer 1 cap
-    .defaultMaxInFlightPerGroup(20)                              // Layer 2 default
-    .perGroupMaxInFlight(Map.of("groupA", 10))                   // Layer 2 per-group override
+    // --- Global in-flight limit ---
+    .globalMaxInFlight(100)                                      // cap across all groups
 
-    // --- Queue thresholds (backpressure) ---
-    .globalQueueThreshold(50)                                    // max tasks waiting globally
+    // --- Queue capacity (backpressure) ---
     .defaultQueueThresholdPerGroup(10)                           // max tasks waiting per group
     .perGroupQueueThreshold(Map.of("groupA", 5))                 // per-group override
 
@@ -142,11 +142,9 @@ GroupPolicy policy = GroupPolicy.builder()
 
 **Concurrency resolution priority:** `perGroupMaxConcurrency` > `concurrencyResolver` > `defaultMaxConcurrencyPerGroup`. Non-positive values from a dynamic `concurrencyResolver` are coerced to 1 at resolution time. Concurrency is resolved once per group on first use ("first resolution fixed" strategy).
 
-**Queue threshold resolution priority:** `perGroupQueueThreshold` > `defaultQueueThresholdPerGroup`. A value of 0 means no waiting is allowed -- tasks that cannot immediately acquire a permit at Layer 2 or Layer 3 are rejected.
+**Queue threshold resolution priority:** `perGroupQueueThreshold` > `defaultQueueThresholdPerGroup`. A value of 0 means no queuing allowed — tasks that cannot immediately acquire a concurrency permit are rejected.
 
-**Builder validation:** The builder throws `IllegalArgumentException` on `build()` for invalid values: concurrency < 1, in-flight < 1, or queue threshold < 0. This applies to all direct builder fields and per-group map values, catching configuration errors early.
-
-Builder performs **defensive copies** of all mutable Map arguments.
+**Builder validation:** The builder throws `IllegalArgumentException` on `build()` for invalid values: concurrency < 1, globalMaxInFlight < 1, or queueThreshold < 0. Builder performs **defensive copies** of all mutable Map arguments.
 
 ### GroupExecutor
 
@@ -154,19 +152,19 @@ Builder performs **defensive copies** of all mutable Map arguments.
 // Create executor
 GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy);
 
-// Submit a single task -- returns a TaskHandle
+// Submit a single task — returns a TaskHandle
 TaskHandle<String> handle = executor.submit("groupA", "task-1", () -> "result");
 GroupResult<String> result = handle.await();
 
-// Batch execution -- blocks until all complete, no fail-fast
+// Batch execution — blocks until all complete, no fail-fast
 List<GroupResult<String>> results = executor.executeAll(List.of(
     new GroupTask<>("g1", "t1", () -> "one"),
     new GroupTask<>("g2", "t2", () -> "two")
 ));
 
 // Per-group management
-executor.shutdownGroup("groupA");   // Shut down one group's executor
-executor.evictGroup("groupA");      // Evict executor + semaphores + bulkhead + queue
+executor.shutdownGroup("groupA");   // Drain queue & evict state
+executor.evictGroup("groupA");      // Evict with write lock + remove lock entry
 
 // Graceful shutdown with timeout
 boolean allDone = executor.shutdown(Duration.ofSeconds(10));
@@ -177,7 +175,7 @@ executor.close();
 
 ### TaskHandle
 
-Wraps `Future<GroupResult<T>>` with ergonomic methods:
+Wraps `CompletableFuture<GroupResult<T>>` with ergonomic methods:
 
 ```java
 TaskHandle<String> handle = executor.submit("g", "t1", () -> "hello");
@@ -242,14 +240,14 @@ TaskLifecycleListener listener = new TaskLifecycleListener() {
 | Scenario | Behavior |
 |----------|----------|
 | Task throws any exception | Caught, recorded in `FAILED` result |
-| Interrupted during semaphore acquire | Interrupt flag restored, `CANCELLED` result |
 | Interrupted during task execution | Interrupt flag restored, `CANCELLED` result |
-| `cancel(true)` called on handle | Future cancelled, virtual thread interrupted |
+| `cancel(true)` called on handle | Future cancelled; queued tasks skipped at dispatch if already cancelled |
 | `await(timeout)` / `join(timeout)` times out | `CANCELLED` result with `TimeoutException` (task continues) |
-| Queue threshold exceeded (ABORT) | `RejectedTaskException` thrown; `executeAll()` collects as `REJECTED` result |
-| Queue threshold exceeded (DISCARD) | `REJECTED` result returned silently |
-| Queue threshold exceeded (CALLER_RUNS) | All held permits released first, then task executed directly in the virtual thread |
-| Custom `RejectionHandler` configured | Handler called on rejection (overrides `RejectionPolicy`); all held permits released first |
+| Global in-flight limit exceeded | Rejected immediately (not queued) |
+| Per-group queue full (ABORT) | `RejectedTaskException` thrown at `await()` time |
+| Per-group queue full (DISCARD) | `REJECTED` result returned silently |
+| Per-group queue full (CALLER_RUNS) | All held permits released first, then task executed in caller's thread |
+| Custom `RejectionHandler` configured | Handler called on rejection (overrides `RejectionPolicy`); permits released first |
 | Listener throws exception | Silently caught and ignored |
 | Concurrency resolver throws exception | Falls back to `defaultMaxConcurrencyPerGroup` |
 | `submit()` / `executeAll()` after shutdown | `IllegalStateException` |
@@ -269,6 +267,7 @@ try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
     for (int i = 0; i < 8; i++) {
         executor.submit("group-1", "t-" + i, () -> {
             // At most 2 tasks run concurrently in group-1
+            // Remaining tasks wait in the queue
             Thread.sleep(100);
             return null;
         });
@@ -281,7 +280,7 @@ try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
 ```java
 GroupPolicy policy = GroupPolicy.builder()
     .defaultMaxConcurrencyPerGroup(10)
-    .globalMaxInFlight(4)  // Only 4 tasks in-flight across ALL groups
+    .globalMaxInFlight(4)  // Only 4 tasks accepted across ALL groups
     .build();
 
 try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
@@ -293,16 +292,7 @@ try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
             });
         }
     }
-} // 12 total tasks but at most 4 execute globally at any time
-```
-
-### Per-group bulkhead (in-flight limit)
-
-```java
-GroupPolicy policy = GroupPolicy.builder()
-    .defaultMaxConcurrencyPerGroup(4)
-    .defaultMaxInFlightPerGroup(3)  // Only 3 tasks queued + running per group
-    .build();
+} // 12 total tasks but at most 4 in-flight globally at any time
 ```
 
 ### Queue threshold with backpressure
@@ -333,7 +323,7 @@ try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
 ```java
 GroupPolicy policy = GroupPolicy.builder()
     .defaultMaxConcurrencyPerGroup(1)
-    .defaultQueueThresholdPerGroup(0)  // no waiting allowed
+    .defaultQueueThresholdPerGroup(0)  // no queuing allowed
     .rejectionHandler(new RejectionHandler() {
         @Override
         public <T> GroupResult<T> onRejected(String groupKey, String taskId,
@@ -365,10 +355,12 @@ List<GroupResult<String>> results = executor.executeAll(tasks);
 ## Thread Safety
 
 - `GroupExecutor` is safe for concurrent `submit()` and `executeAll()` calls.
-- Semaphore and executor caches use `ConcurrentHashMap` with atomic operations.
-- `evictGroup()` uses a per-group `ReentrantReadWriteLock` (write lock) to atomically evict all resources, while `submit()` and resource lookups use read locks for consistency.
-- Shutdown is idempotent via `AtomicBoolean`.
-- `shutdownGroup()` uses atomic `ConcurrentHashMap.compute()` to prevent race conditions.
+- Per-group state uses `ConcurrentHashMap` with `computeIfAbsent` ("first resolution fixed").
+- `evictGroup()` uses a per-group `ReentrantReadWriteLock` (write lock) to atomically evict all resources; `submit()` uses read locks for consistency. Lock entries are removed after eviction to prevent unbounded growth.
+- Shutdown is idempotent via `AtomicBoolean`. `shutdown()` clears all caches; running tasks hold direct semaphore references and release permits on completion.
+- All semaphores use fair mode to prevent starvation.
+- `onTaskDone()` runs in a `finally` block to guarantee permit release even if an `Error` is thrown.
+- `CALLER_RUNS` executes in the caller's thread without holding any permits.
 
 ## Build & Test
 

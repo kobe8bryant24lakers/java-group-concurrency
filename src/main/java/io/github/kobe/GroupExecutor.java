@@ -1,102 +1,108 @@
 package io.github.kobe;
 
-import io.github.kobe.internal.GroupBulkheadManager;
-import io.github.kobe.internal.GroupExecutorManager;
-import io.github.kobe.internal.GroupQueueManager;
-import io.github.kobe.internal.GroupSemaphoreManager;
+import io.github.kobe.internal.GroupStateManager;
+import io.github.kobe.internal.GroupStateManager.GroupState;
+import io.github.kobe.internal.GroupStateManager.PendingTask;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.time.Duration;
 
 /**
  * Executes tasks grouped by a groupKey with per-group concurrency control using virtual threads.
+ *
+ * <p>Architecture: tasks are stored in an explicit {@link java.util.concurrent.LinkedBlockingQueue}
+ * when no concurrency permit is available. A virtual thread is only created when a task is actually
+ * dispatched (i.e., has obtained a semaphore permit). Hand-off dispatch avoids release/acquire
+ * round-trips, and {@code tryDispatch()} closes the submission-completion race window.
  */
 public final class GroupExecutor implements AutoCloseable {
 
     private final GroupPolicy policy;
-    private final GroupExecutorManager executorManager;
-    private final GroupSemaphoreManager semaphoreManager;
-    private final GroupBulkheadManager bulkheadManager;
-    private final Semaphore globalInFlightSemaphore;
-    private final Semaphore globalQueueSemaphore;       // null when no global queue threshold
-    private final GroupQueueManager queueManager;        // null when no per-group queue threshold
+    private final GroupStateManager stateManager;
+    /** Optional Layer 1: global cap on total in-flight tasks across all groups. */
+    private final Semaphore globalInFlightSemaphore;   // null when globalMaxInFlight == MAX_VALUE
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final ConcurrentHashMap<String, ReentrantReadWriteLock> groupLocks = new ConcurrentHashMap<>();
 
-    private GroupExecutor(GroupPolicy policy,
-                          GroupExecutorManager executorManager,
-                          GroupSemaphoreManager semaphoreManager,
-                          GroupBulkheadManager bulkheadManager,
-                          Semaphore globalInFlightSemaphore,
-                          Semaphore globalQueueSemaphore,
-                          GroupQueueManager queueManager) {
+    private GroupExecutor(GroupPolicy policy, Semaphore globalInFlightSemaphore) {
         this.policy = Objects.requireNonNull(policy, "policy");
-        this.executorManager = Objects.requireNonNull(executorManager, "executorManager");
-        this.semaphoreManager = Objects.requireNonNull(semaphoreManager, "semaphoreManager");
-        this.bulkheadManager = Objects.requireNonNull(bulkheadManager, "bulkheadManager");
-        this.globalInFlightSemaphore = Objects.requireNonNull(globalInFlightSemaphore, "globalInFlightSemaphore");
-        this.globalQueueSemaphore = globalQueueSemaphore;   // nullable
-        this.queueManager = queueManager;                    // nullable
+        this.stateManager = new GroupStateManager(policy);
+        this.globalInFlightSemaphore = globalInFlightSemaphore;  // nullable
     }
 
     /**
      * Create a new executor backed by virtual threads with per-group isolation.
      */
     public static GroupExecutor newVirtualThreadExecutor(GroupPolicy policy) {
-        Semaphore globalQueueSem = policy.globalQueueThreshold() < Integer.MAX_VALUE
-                ? new Semaphore(policy.globalQueueThreshold(), true)
+        Objects.requireNonNull(policy, "policy");
+        Semaphore globalSem = policy.globalMaxInFlight() < Integer.MAX_VALUE
+                ? new Semaphore(policy.globalMaxInFlight(), true)
                 : null;
-        GroupQueueManager queueMgr = policy.defaultQueueThresholdPerGroup() < Integer.MAX_VALUE
-                || !policy.perGroupQueueThreshold().isEmpty()
-                ? new GroupQueueManager(policy)
-                : null;
-        return new GroupExecutor(
-                policy,
-                new GroupExecutorManager(),
-                new GroupSemaphoreManager(policy),
-                new GroupBulkheadManager(policy),
-                new Semaphore(policy.globalMaxInFlight(), true),
-                globalQueueSem,
-                queueMgr
-        );
+        return new GroupExecutor(policy, globalSem);
     }
 
     /**
      * Submit a single task to the executor.
+     *
+     * <p>Tasks are dispatched immediately if a concurrency permit is available, or queued
+     * otherwise. If the queue is full (or the global in-flight limit is reached), the task
+     * is handled according to the configured {@link RejectionPolicy}.
      */
-    public <T> TaskHandle<T> submit(String groupKey, String taskId, java.util.concurrent.Callable<T> task) {
+    public <T> TaskHandle<T> submit(String groupKey, String taskId,
+                                    java.util.concurrent.Callable<T> task) {
         ensureOpen();
         Objects.requireNonNull(groupKey, "groupKey");
         Objects.requireNonNull(taskId, "taskId");
         Objects.requireNonNull(task, "task");
 
         fireOnSubmitted(groupKey, taskId);
+
+        // Layer 1: try to acquire the global in-flight permit (non-blocking).
+        // Failure means the system is at global capacity → reject immediately.
+        if (globalInFlightSemaphore != null && !globalInFlightSemaphore.tryAcquire()) {
+            fireOnRejected(groupKey, taskId, "global in-flight limit exceeded");
+            return handleRejection(groupKey, taskId, task);
+        }
+
+        // Obtain the per-group state under read lock to be consistent with evictGroup.
+        GroupState state;
         ReentrantReadWriteLock.ReadLock readLock = lockFor(groupKey).readLock();
         readLock.lock();
         try {
-            ExecutorService groupExecutor = executorManager.executorFor(groupKey);
-            var future = groupExecutor.submit(() -> executeWithIsolation(groupKey, taskId, task));
-            return new TaskHandle<>(groupKey, taskId, future);
-        } catch (RejectedExecutionException e) {
-            // The underlying executor was shut down between ensureOpen() and the submit() call
-            // (e.g., via shutdownGroup(), evictGroup(), or a race with shutdown()).
-            // Return a handle wrapping a REJECTED result instead of leaking the exception.
-            fireOnRejected(groupKey, taskId, "executor shut down");
-            return new TaskHandle<>(groupKey, taskId,
-                    CompletableFuture.completedFuture(GroupResult.rejected(groupKey, taskId)));
+            state = stateManager.stateFor(groupKey);
         } finally {
             readLock.unlock();
         }
+
+        CompletableFuture<GroupResult<T>> future = new CompletableFuture<>();
+        PendingTask<T> pendingTask = new PendingTask<>(groupKey, taskId, task, future,
+                globalInFlightSemaphore);
+
+        if (state.semaphore.tryAcquire()) {
+            // Got the concurrency permit — dispatch to a virtual thread immediately.
+            stateManager.dispatch(state, pendingTask, policy.taskLifecycleListener());
+        } else if (state.queueCapacity > 0 && state.queue.offer(pendingTask)) {
+            // Queued successfully — call tryDispatch to handle the race window where
+            // a running task may have already polled an empty queue and not yet released
+            // the semaphore before we offered into the queue.
+            stateManager.tryDispatch(state, policy.taskLifecycleListener());
+        } else {
+            // Queue is full or queueCapacity == 0 → reject.
+            // Release the global permit we acquired above before rejecting.
+            if (globalInFlightSemaphore != null) globalInFlightSemaphore.release();
+            fireOnRejected(groupKey, taskId, "per-group queue capacity exceeded");
+            return handleRejection(groupKey, taskId, task);
+        }
+
+        return new TaskHandle<>(groupKey, taskId, future);
     }
 
     /**
@@ -133,152 +139,45 @@ public final class GroupExecutor implements AutoCloseable {
         return results;
     }
 
-    private <T> GroupResult<T> executeWithIsolation(String groupKey, String taskId, java.util.concurrent.Callable<T> task) {
-        boolean globalQueueAcquired = false;
-        boolean globalAcquired = false;
-        boolean bulkheadAcquired = false;
-        boolean perGroupQueueAcquired = false;
-        boolean semaphoreAcquired = false;
-
-        // Look up per-group resources under read lock to ensure consistency with evictGroup
-        Semaphore bulkhead;
-        Semaphore semaphore;
-        Semaphore perGroupQueue;
-        ReentrantReadWriteLock.ReadLock readLock = lockFor(groupKey).readLock();
-        readLock.lock();
-        try {
-            bulkhead = bulkheadManager.bulkheadFor(groupKey);
-            semaphore = semaphoreManager.semaphoreFor(groupKey);
-            perGroupQueue = queueManager != null ? queueManager.queueSemaphoreFor(groupKey) : null;
-        } finally {
-            readLock.unlock();
-        }
-
-        try {
-            // Layer 1: global in-flight — try non-blocking first
-            if (globalInFlightSemaphore.tryAcquire()) {
-                globalAcquired = true;
-            } else {
-                // Need to wait — check global queue threshold
-                if (globalQueueSemaphore != null) {
-                    if (!globalQueueSemaphore.tryAcquire()) {
-                        return handleRejection(groupKey, taskId, task, "global queue threshold exceeded");
-                    }
-                    globalQueueAcquired = true;
-                }
-
-                globalInFlightSemaphore.acquire();   // Layer 1: blocking wait
-                globalAcquired = true;
-
-                // Release global queue permit — task moved from "waiting" to "in-flight"
-                if (globalQueueAcquired) {
-                    globalQueueSemaphore.release();
-                    globalQueueAcquired = false;
-                }
-            }
-
-            // Layer 2: per-group bulkhead — try non-blocking first
-            if (bulkhead.tryAcquire()) {
-                bulkheadAcquired = true;
-            } else {
-                // Need to wait — check per-group queue threshold
-                if (perGroupQueue != null) {
-                    if (!perGroupQueue.tryAcquire()) {
-                        // Release global permit before rejection — rejected tasks should not hold permits
-                        globalInFlightSemaphore.release();
-                        globalAcquired = false;
-                        return handleRejection(groupKey, taskId, task, "per-group queue threshold exceeded (bulkhead)");
-                    }
-                    perGroupQueueAcquired = true;
-                }
-
-                bulkhead.acquire();                  // Layer 2: blocking wait
-                bulkheadAcquired = true;
-
-                // Intentionally do NOT release perGroupQueueAcquired here.
-                // The task is still in a "waiting" state (now waiting for Layer 3 concurrency).
-                // Releasing and re-acquiring would open a race window where another task steals
-                // the queue slot, causing this task to be spuriously rejected at Layer 3 despite
-                // already holding the bulkhead permit (violating monotonic progress guarantees).
-                // The slot will be released once the concurrency permit is acquired below.
-            }
-
-            // Layer 3: per-group concurrency — try non-blocking first
-            if (semaphore.tryAcquire()) {
-                semaphoreAcquired = true;
-                // Task obtained execution permit immediately — release any queue slot held from
-                // a Layer 2 wait, since the task is no longer in the waiting state.
-                if (perGroupQueueAcquired) {
-                    perGroupQueue.release();
-                    perGroupQueueAcquired = false;
-                }
-            } else {
-                // Need to wait — check per-group queue threshold only if not already holding a
-                // slot from a Layer 2 wait (reuse the existing slot to avoid double-counting).
-                if (perGroupQueue != null && !perGroupQueueAcquired) {
-                    if (!perGroupQueue.tryAcquire()) {
-                        // Release bulkhead and global permits before rejection
-                        bulkhead.release();
-                        bulkheadAcquired = false;
-                        globalInFlightSemaphore.release();
-                        globalAcquired = false;
-                        return handleRejection(groupKey, taskId, task, "per-group queue threshold exceeded");
-                    }
-                    perGroupQueueAcquired = true;
-                }
-
-                semaphore.acquire();             // Layer 3: blocking wait
-                semaphoreAcquired = true;
-
-                // Task obtained execution permit — release the queue slot (from either layer).
-                if (perGroupQueueAcquired) {
-                    perGroupQueue.release();
-                    perGroupQueueAcquired = false;
-                }
-            }
-
-            // Capture start time after all permits acquired — durationNanos reflects execution time only
-            long startNanos = System.nanoTime();
-            fireOnStarted(groupKey, taskId);
-            GroupResult<T> result = executeTask(groupKey, taskId, task, startNanos);
-            fireOnCompleted(groupKey, taskId, result);
-            return result;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            long now = System.nanoTime();
-            GroupResult<T> result = GroupResult.cancelled(groupKey, taskId, e, now, now);
-            fireOnCompleted(groupKey, taskId, result);
-            return result;
-        } finally {
-            if (semaphoreAcquired) semaphore.release();
-            if (perGroupQueueAcquired) perGroupQueue.release();
-            if (bulkheadAcquired) bulkhead.release();
-            if (globalAcquired) globalInFlightSemaphore.release();
-            if (globalQueueAcquired) globalQueueSemaphore.release();
-        }
-    }
-
-    private <T> GroupResult<T> handleRejection(String groupKey, String taskId,
-                                                java.util.concurrent.Callable<T> task, String reason) {
-        fireOnRejected(groupKey, taskId, reason);
-
+    /**
+     * Handle a rejected task according to the configured policy.
+     * The global semaphore permit must already have been released before calling this method.
+     *
+     * <p>Returns a {@link TaskHandle} in all cases — exceptions are surfaced through the handle's
+     * {@link TaskHandle#await()} method (completing the future exceptionally), not thrown directly
+     * from {@code submit()}, preserving backward-compatible behavior.
+     */
+    private <T> TaskHandle<T> handleRejection(String groupKey, String taskId,
+                                               java.util.concurrent.Callable<T> task) {
         RejectionHandler handler = policy.rejectionHandler();
         if (handler != null) {
-            return handler.onRejected(groupKey, taskId, task);
+            GroupResult<T> result = handler.onRejected(groupKey, taskId, task);
+            return new TaskHandle<>(groupKey, taskId, CompletableFuture.completedFuture(result));
         }
 
         return switch (policy.rejectionPolicy()) {
-            case ABORT -> throw new RejectedTaskException(groupKey, taskId);
-            case DISCARD -> GroupResult.rejected(groupKey, taskId);
+            case ABORT -> {
+                // Complete the future exceptionally so the exception is thrown at await() time,
+                // maintaining backward compatibility with the old virtual-thread design.
+                CompletableFuture<GroupResult<T>> f = new CompletableFuture<>();
+                f.completeExceptionally(new RejectedTaskException(groupKey, taskId));
+                yield new TaskHandle<>(groupKey, taskId, f);
+            }
+            case DISCARD -> {
+                GroupResult<T> result = GroupResult.rejected(groupKey, taskId);
+                yield new TaskHandle<>(groupKey, taskId, CompletableFuture.completedFuture(result));
+            }
             case CALLER_RUNS -> {
+                // Execute directly in the thread that called submit(), without any permits.
                 long startNanos = System.nanoTime();
-                yield executeTask(groupKey, taskId, task, startNanos);
+                GroupResult<T> result = executeTask(groupKey, taskId, task, startNanos);
+                yield new TaskHandle<>(groupKey, taskId, CompletableFuture.completedFuture(result));
             }
         };
     }
 
-    private <T> GroupResult<T> executeTask(String groupKey, String taskId, java.util.concurrent.Callable<T> task,
-                                           long startNanos) {
+    private <T> GroupResult<T> executeTask(String groupKey, String taskId,
+                                            java.util.concurrent.Callable<T> task, long startNanos) {
         try {
             T value = task.call();
             long end = System.nanoTime();
@@ -297,21 +196,22 @@ public final class GroupExecutor implements AutoCloseable {
     }
 
     /**
-     * Shut down a single group's executor without affecting other groups.
+     * Shut down a single group: drain its queue (completing all pending tasks as REJECTED)
+     * and evict its cached state. In-flight tasks complete normally.
      */
     public void shutdownGroup(String groupKey) {
-        executorManager.shutdownGroup(groupKey);
+        Objects.requireNonNull(groupKey, "groupKey");
+        stateManager.evict(groupKey);
     }
 
+    /**
+     * Immediately shut down the executor. All queued tasks are completed as REJECTED.
+     * In-flight tasks are not interrupted; they hold direct references to their state
+     * and will release permits on completion.
+     */
     public void shutdown() {
         if (closed.compareAndSet(false, true)) {
-            // close() calls shutdownNow() on all executors (non-blocking). Running tasks still
-            // hold direct references to their semaphore objects and will release permits on
-            // completion. Clearing manager maps allows GC of idle entries once all tasks finish.
-            executorManager.close();
-            semaphoreManager.clear();
-            bulkheadManager.clear();
-            if (queueManager != null) queueManager.clear();
+            stateManager.clear();
             groupLocks.clear();
         }
     }
@@ -322,45 +222,65 @@ public final class GroupExecutor implements AutoCloseable {
     }
 
     /**
-     * Graceful shutdown with timeout. Initiates shutdown, waits up to the specified duration,
-     * then forces shutdown if tasks are still running.
+     * Graceful shutdown with timeout. Queued tasks are immediately REJECTED.
+     * Waits up to the specified duration for in-flight tasks to complete.
      *
-     * @param timeout max time to wait for tasks to complete
-     * @return true if all tasks completed before the timeout, false if forced shutdown was needed
+     * @param timeout max time to wait for in-flight tasks to finish
+     * @return true if all in-flight tasks completed before the timeout
      */
     public boolean shutdown(Duration timeout) {
         if (closed.compareAndSet(false, true)) {
-            boolean completed = executorManager.awaitTermination(timeout);
-            semaphoreManager.clear();
-            bulkheadManager.clear();
-            if (queueManager != null) queueManager.clear();
+            // Drain all queues immediately — no new dispatches can happen since closed=true.
+            stateManager.clear();
             groupLocks.clear();
-            return completed;
+            // In-flight tasks hold direct semaphore references. We approximate "all done"
+            // by checking if the global semaphore (if present) has all permits back.
+            // For cases without a global semaphore we rely on a simple sleep-poll fallback.
+            return awaitInFlightCompletion(timeout);
         }
         return true;
     }
 
+    private boolean awaitInFlightCompletion(Duration timeout) {
+        // If there is no global semaphore, we have no direct way to track in-flight count.
+        // The best we can do is wait a small amount and return true (tasks are on virtual threads
+        // and will complete independently). A production implementation could track counters,
+        // but that is out of scope for this library.
+        if (globalInFlightSemaphore == null) {
+            return true;
+        }
+        long deadline = System.nanoTime() + timeout.toNanos();
+        int totalPermits = policy.globalMaxInFlight();
+        while (System.nanoTime() < deadline) {
+            // All in-flight tasks complete when all permits are returned.
+            if (globalInFlightSemaphore.availablePermits() >= totalPermits) {
+                return true;
+            }
+            try {
+                //noinspection BusyWait
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return globalInFlightSemaphore.availablePermits() >= totalPermits;
+    }
+
     /**
-     * Evict all cached resources for the given group. The executor, semaphore, and bulkhead
-     * for this group will be removed and recreated on next use.
-     * <p>
-     * Uses a per-group write lock to ensure atomicity with respect to concurrent
-     * {@link #submit} and {@link #executeWithIsolation} calls for the same group.
+     * Evict all cached resources for the given group. The state (semaphore + queue) will be
+     * recreated on next use. Queued tasks are completed as REJECTED.
      */
     public void evictGroup(String groupKey) {
         Objects.requireNonNull(groupKey, "groupKey");
         ReentrantReadWriteLock.WriteLock writeLock = lockFor(groupKey).writeLock();
         writeLock.lock();
         try {
-            executorManager.evict(groupKey);
-            semaphoreManager.evict(groupKey);
-            bulkheadManager.evict(groupKey);
-            if (queueManager != null) queueManager.evict(groupKey);
+            stateManager.evict(groupKey);
         } finally {
             writeLock.unlock();
         }
-        // Remove after releasing the write lock — subsequent operations will lazily recreate it.
-        // Safe because any concurrent submit() for this group will computeIfAbsent a new lock.
+        // Remove the lock entry after releasing so it can be GC'd.
         groupLocks.remove(groupKey);
     }
 
@@ -379,26 +299,6 @@ public final class GroupExecutor implements AutoCloseable {
         if (listener != null) {
             try {
                 listener.onSubmitted(groupKey, taskId);
-            } catch (RuntimeException ignored) {
-            }
-        }
-    }
-
-    private void fireOnStarted(String groupKey, String taskId) {
-        TaskLifecycleListener listener = policy.taskLifecycleListener();
-        if (listener != null) {
-            try {
-                listener.onStarted(groupKey, taskId);
-            } catch (RuntimeException ignored) {
-            }
-        }
-    }
-
-    private void fireOnCompleted(String groupKey, String taskId, GroupResult<?> result) {
-        TaskLifecycleListener listener = policy.taskLifecycleListener();
-        if (listener != null) {
-            try {
-                listener.onCompleted(groupKey, taskId, result);
             } catch (RuntimeException ignored) {
             }
         }

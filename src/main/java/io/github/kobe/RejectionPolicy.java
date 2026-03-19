@@ -16,9 +16,9 @@ public enum RejectionPolicy {
     DISCARD,
 
     /**
-     * Execute the task directly in the group executor's virtual thread
-     * (the thread running {@code executeWithIsolation}), bypassing concurrency permits.
-     * This is <b>not</b> the thread that originally called {@code submit()}.
+     * Execute the task directly in the thread that called {@code submit()},
+     * bypassing concurrency permits entirely.
+     * This is the standard "caller runs" back-pressure pattern.
      */
     CALLER_RUNS
 }

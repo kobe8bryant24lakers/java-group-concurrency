@@ -4,7 +4,6 @@ import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -15,9 +14,9 @@ public final class TaskHandle<T> {
 
     private final String groupKey;
     private final String taskId;
-    private final Future<GroupResult<T>> future;
+    private final CompletableFuture<GroupResult<T>> future;
 
-    TaskHandle(String groupKey, String taskId, Future<GroupResult<T>> future) {
+    TaskHandle(String groupKey, String taskId, CompletableFuture<GroupResult<T>> future) {
         this.groupKey = Objects.requireNonNull(groupKey, "groupKey");
         this.taskId = Objects.requireNonNull(taskId, "taskId");
         this.future = Objects.requireNonNull(future, "future");
@@ -31,7 +30,7 @@ public final class TaskHandle<T> {
         return taskId;
     }
 
-    public Future<GroupResult<T>> future() {
+    public CompletableFuture<GroupResult<T>> future() {
         return future;
     }
 
@@ -112,25 +111,12 @@ public final class TaskHandle<T> {
     }
 
     /**
-     * Bridge this handle to a {@link CompletableFuture}. The returned future is completed
-     * via a virtual thread that waits for the underlying task to finish.
+     * Returns the underlying {@link CompletableFuture} directly.
      *
      * @return a CompletableFuture that completes with the GroupResult
      */
     public CompletableFuture<GroupResult<T>> toCompletableFuture() {
-        CompletableFuture<GroupResult<T>> cf = new CompletableFuture<>();
-        Thread.startVirtualThread(() -> {
-            try {
-                cf.complete(await());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                long now = System.nanoTime();
-                cf.complete(GroupResult.cancelled(groupKey, taskId, e, now, now));
-            } catch (RuntimeException e) {
-                cf.completeExceptionally(e);
-            }
-        });
-        return cf;
+        return future;
     }
 
     public boolean cancel(boolean mayInterruptIfRunning) {
