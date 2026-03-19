@@ -319,7 +319,7 @@ public final class GroupExecutor implements AutoCloseable {
         }
         GroupStateManager.AggregateTotals totals = stateManager.aggregateTotals();
         int globalUsed = globalInFlightSemaphore != null
-                ? policy.globalMaxInFlight() - globalInFlightSemaphore.availablePermits()
+                ? Math.max(0, policy.globalMaxInFlight() - globalInFlightSemaphore.availablePermits())
                 : 0;
         return new GroupExecutorStats(totals.activeGroupCount(), totals.totalActiveCount(),
                 totals.totalQueuedCount(), globalUsed, policy.globalMaxInFlight());

@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GroupExecutorStatsTest {
@@ -225,6 +226,15 @@ class GroupExecutorStatsTest {
 
         Set<String> keys = executor.activeGroupKeys();
         assertTrue(keys.isEmpty());
+    }
+
+    @Test
+    void testGroupStatsNullKeyThrowsNPE() {
+        GroupPolicy policy = GroupPolicy.builder().build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            assertThrows(NullPointerException.class, () -> executor.groupStats(null));
+        }
     }
 
     @Test
