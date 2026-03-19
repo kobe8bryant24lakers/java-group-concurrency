@@ -299,6 +299,7 @@ public final class GroupExecutor implements AutoCloseable {
      * @return snapshot of group stats, or empty
      */
     public Optional<GroupStats> groupStats(String groupKey) {
+        Objects.requireNonNull(groupKey, "groupKey");
         if (closed.get()) {
             return Optional.empty();
         }
@@ -316,12 +317,12 @@ public final class GroupExecutor implements AutoCloseable {
         if (closed.get()) {
             return new GroupExecutorStats(0, 0, 0, 0, policy.globalMaxInFlight());
         }
-        int[] totals = stateManager.aggregateTotals();
+        GroupStateManager.AggregateTotals totals = stateManager.aggregateTotals();
         int globalUsed = globalInFlightSemaphore != null
                 ? policy.globalMaxInFlight() - globalInFlightSemaphore.availablePermits()
                 : 0;
-        return new GroupExecutorStats(totals[0], totals[1], totals[2],
-                globalUsed, policy.globalMaxInFlight());
+        return new GroupExecutorStats(totals.activeGroupCount(), totals.totalActiveCount(),
+                totals.totalQueuedCount(), globalUsed, policy.globalMaxInFlight());
     }
 
     /**

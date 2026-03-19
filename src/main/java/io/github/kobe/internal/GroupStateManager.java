@@ -5,7 +5,6 @@ import io.github.kobe.GroupResult;
 import io.github.kobe.GroupStats;
 import io.github.kobe.TaskLifecycleListener;
 
-import java.util.Collections;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
@@ -250,7 +249,7 @@ public final class GroupStateManager {
         if (state == null) {
             return Optional.empty();
         }
-        int activeCount = state.maxConcurrency - state.semaphore.availablePermits();
+        int activeCount = Math.max(0, state.maxConcurrency - state.semaphore.availablePermits());
         int queuedCount = state.queue.size();
         return Optional.of(new GroupStats(groupKey, activeCount, queuedCount,
                 state.maxConcurrency, state.queueCapacity));
@@ -260,23 +259,27 @@ public final class GroupStateManager {
      * Returns an unmodifiable snapshot of the currently allocated group keys.
      */
     public Set<String> activeGroupKeys() {
-        return Collections.unmodifiableSet(stateByGroup.keySet());
+        return Set.copyOf(stateByGroup.keySet());
     }
 
     /**
-     * Aggregates totals across all groups: active count, queued count, and group count.
-     * Returns an int array: [activeGroupCount, totalActiveCount, totalQueuedCount].
+     * Aggregated totals across all groups: group count, active count, and queued count.
      */
-    public int[] aggregateTotals() {
+    public record AggregateTotals(int activeGroupCount, int totalActiveCount, int totalQueuedCount) {}
+
+    /**
+     * Aggregates totals across all groups: active count, queued count, and group count.
+     */
+    public AggregateTotals aggregateTotals() {
         int activeGroupCount = 0;
         int totalActive = 0;
         int totalQueued = 0;
         for (GroupState state : stateByGroup.values()) {
             activeGroupCount++;
-            totalActive += state.maxConcurrency - state.semaphore.availablePermits();
+            totalActive += Math.max(0, state.maxConcurrency - state.semaphore.availablePermits());
             totalQueued += state.queue.size();
         }
-        return new int[]{activeGroupCount, totalActive, totalQueued};
+        return new AggregateTotals(activeGroupCount, totalActive, totalQueued);
     }
 
     // ---- Listener helpers ----
