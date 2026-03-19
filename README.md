@@ -233,6 +233,42 @@ TaskLifecycleListener listener = new TaskLifecycleListener() {
 };
 ```
 
+### Monitoring / Observability
+
+The executor exposes read-only, point-in-time metrics through `stats()`, `groupStats()`, and `activeGroupKeys()`. All three methods are non-blocking, thread-safe, and safe to call after shutdown (returning zeroed/empty values).
+
+```java
+try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+    // Submit some tasks...
+
+    // Executor-wide stats
+    GroupExecutorStats stats = executor.stats();
+    System.out.printf("Groups: %d, Active: %d, Queued: %d, GlobalInFlight: %d/%d%n",
+            stats.activeGroupCount(),
+            stats.totalActiveCount(),
+            stats.totalQueuedCount(),
+            stats.globalInFlightUsed(),
+            stats.globalInFlightMax());
+
+    // Per-group stats
+    Optional<GroupStats> groupStats = executor.groupStats("groupA");
+    groupStats.ifPresent(gs ->
+        System.out.printf("Group %s: active=%d, queued=%d, maxConcurrency=%d, queueCapacity=%d%n",
+                gs.groupKey(), gs.activeCount(), gs.queuedCount(),
+                gs.maxConcurrency(), gs.queueCapacity()));
+
+    // Active group keys
+    Set<String> keys = executor.activeGroupKeys();
+    System.out.println("Active groups: " + keys);
+}
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `stats()` | `GroupExecutorStats` | Aggregated counters across all groups + global in-flight usage |
+| `groupStats(groupKey)` | `Optional<GroupStats>` | Snapshot of a single group (empty if not allocated) |
+| `activeGroupKeys()` | `Set<String>` | Unmodifiable snapshot of group keys with allocated state |
+
 ---
 
 ## Error Handling
