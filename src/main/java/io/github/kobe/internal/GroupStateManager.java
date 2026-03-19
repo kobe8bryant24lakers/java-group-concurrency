@@ -228,7 +228,6 @@ public final class GroupStateManager {
     private void drainQueueAsRejected(GroupState state) {
         PendingTask<?> task;
         while ((task = state.queue.poll()) != null) {
-            long now = System.nanoTime();
             GroupResult rejected = GroupResult.rejected(task.groupKey, task.taskId);
             ((PendingTask) task).future.complete(rejected);
             // Release the global semaphore permit the task was holding (if any)
