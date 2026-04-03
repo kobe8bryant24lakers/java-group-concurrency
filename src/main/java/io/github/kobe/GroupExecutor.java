@@ -204,7 +204,15 @@ public final class GroupExecutor implements AutoCloseable {
      */
     public void shutdownGroup(String groupKey) {
         Objects.requireNonNull(groupKey, "groupKey");
-        stateManager.evict(groupKey);
+        ReentrantReadWriteLock.WriteLock writeLock = lockFor(groupKey).writeLock();
+        writeLock.lock();
+        try {
+            stateManager.evict(groupKey);
+        } finally {
+            writeLock.unlock();
+        }
+        // Remove lock entry after shutdown to avoid unbounded lock map growth.
+        groupLocks.remove(groupKey);
     }
 
     /**

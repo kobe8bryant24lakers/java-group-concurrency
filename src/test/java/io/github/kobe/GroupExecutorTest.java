@@ -273,6 +273,46 @@ class GroupExecutorTest {
     }
 
     @Test
+    void testShutdownGroupRejectsQueuedTasksAndAllowsRecreate() throws Exception {
+        GroupPolicy policy = GroupPolicy.builder()
+                .defaultMaxConcurrencyPerGroup(1)
+                .defaultQueueThresholdPerGroup(10)
+                .build();
+
+        try (GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy)) {
+            CountDownLatch runningStarted = new CountDownLatch(1);
+            CountDownLatch runningBlock = new CountDownLatch(1);
+
+            TaskHandle<String> running = executor.submit("g", "run-1", () -> {
+                runningStarted.countDown();
+                runningBlock.await();
+                return "running-done";
+            });
+            assertTrue(runningStarted.await(5, TimeUnit.SECONDS));
+
+            TaskHandle<String> queued1 = executor.submit("g", "q-1", () -> "queued-1");
+            TaskHandle<String> queued2 = executor.submit("g", "q-2", () -> "queued-2");
+
+            executor.shutdownGroup("g");
+
+            GroupResult<String> queuedResult1 = queued1.await();
+            GroupResult<String> queuedResult2 = queued2.await();
+            assertEquals(TaskStatus.REJECTED, queuedResult1.status());
+            assertEquals(TaskStatus.REJECTED, queuedResult2.status());
+
+            runningBlock.countDown();
+            GroupResult<String> runningResult = running.await();
+            assertEquals(TaskStatus.SUCCESS, runningResult.status());
+
+            // Group state should be recreated on next submit.
+            TaskHandle<String> recreated = executor.submit("g", "new-1", () -> "recreated");
+            GroupResult<String> recreatedResult = recreated.await();
+            assertEquals(TaskStatus.SUCCESS, recreatedResult.status());
+            assertEquals("recreated", recreatedResult.value());
+        }
+    }
+
+    @Test
     void testSubmitAfterShutdownThrows() {
         GroupPolicy policy = GroupPolicy.builder().build();
         GroupExecutor executor = GroupExecutor.newVirtualThreadExecutor(policy);
